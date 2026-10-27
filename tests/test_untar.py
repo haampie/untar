@@ -592,13 +592,23 @@ LISTED_ONCE = [
 
 @needs_symlinks
 def test_listed_twice(tmp_path):
-    """S02, S04: tar archives an entry listed twice as a hardlink to itself, symlinks
-    included."""
-    again = [(name, "h", name, mode) for name, kind, _, mode in LISTED_ONCE[1:]]
-    data = make_tar(LISTED_ONCE + LISTED_ONCE[:1] + again)
+    """S02: a dir listed twice is one dir."""
+    data = make_tar(LISTED_ONCE + LISTED_ONCE[:1])
     untar.extract(io.BytesIO(data), str(tmp_path / "actual"))
     tarfile_extract(make_tar(LISTED_ONCE), tmp_path / "expected")
     assert snapshot(tmp_path / "actual") == snapshot(tmp_path / "expected")
+
+
+@needs_symlinks
+@pytest.mark.parametrize("again", LISTED_ONCE[1:], ids=lambda m: m[0])
+def test_listed_twice_as_hardlinks(tmp_path, again):
+    """S04: tar archives other entries listed twice as hardlinks to themselves, symlinks
+    included, which implementations replace, empty, or leave alone."""
+    name, _, _, mode = again
+    data = make_tar(LISTED_ONCE + [(name, "h", name, mode)])
+    with pytest.raises(untar.Error, match="to itself"):
+        untar.extract(io.BytesIO(data), str(tmp_path / "d"))
+    assert os.listdir(tmp_path / "d") == []
 
 
 def is_gnu_tar() -> bool:
@@ -614,7 +624,8 @@ def is_gnu_tar() -> bool:
 )
 @pytest.mark.parametrize("format", ["gnu", "posix"])
 def test_listed_twice_by_tar(tmp_path, format):
-    """Like GNU tar's link04 test: tar cf archive dir dir"""
+    """S04: like GNU tar's link04 test, tar cf archive dir dir, which archives the entries
+    of dir again as hardlinks to themselves."""
     src = tmp_path / "src"
     for name, kind, payload, _ in LISTED_ONCE:
         if kind == "d":
@@ -637,8 +648,8 @@ def test_listed_twice_by_tar(tmp_path, format):
         ],
         check=True,
     )
-    untar.extract(str(archive), str(tmp_path / "actual"))
-    assert snapshot(tmp_path / "actual") == snapshot(src)
+    with pytest.raises(untar.Error, match="to itself"):
+        untar.extract(str(archive), str(tmp_path / "actual"))
 
 
 def test_dir_hardlinked_to_itself(tmp_path):

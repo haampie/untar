@@ -692,11 +692,12 @@ def test_invalid_hardlinks(tmp_path, archive):
     rejects(archive, tmp_path, "hardlinks")
 
 
-def test_hardlink_to_itself(tmp_path):
-    """S04: tar cf a.tar f f archives f twice, the second time as a hardlink to itself."""
-    archive = member("f", b"x") + member("f", type=b"1", linkname="f") + EOF
-    untar.extract(io.BytesIO(archive), str(tmp_path))
-    assert (tmp_path / "f").read_bytes() == b"x"
+@pytest.mark.parametrize("linkname", ["f", "./f"])
+def test_hardlink_to_itself(tmp_path, linkname):
+    """S04: tar cf a.tar f f archives f twice, the second time as a hardlink to itself,
+    which implementations replace, empty, or leave alone."""
+    archive = member("f", b"x") + member("f", type=b"1", linkname=linkname) + EOF
+    rejects(archive, tmp_path, "to itself")
 
 
 @pytest.mark.skipif(
