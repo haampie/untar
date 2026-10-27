@@ -124,6 +124,15 @@ def _octal(field: bytes) -> int:
     return int(digits, 8) if digits else 0
 
 
+def _name(raw: bytes) -> str:
+    """A name, which must be UTF-8: readers create other names as they are, or replace their
+    bytes."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Error(f"Archive contains a name that is not UTF-8 {raw!r}") from None
+
+
 def _long_name(data: bytes) -> str:
     """A GNU long name or link, which ends with NULs. Readers disagree on a NUL inside it: some
     stop there, others keep the rest."""
@@ -364,7 +373,6 @@ class TarReader:
                     raise Error(f"Archive contains an invalid pax {key} {pax[key]!r}")
 
             raw_name, _, after_name = header[0:100].partition(b"\0")
-            header_name = raw_name.decode("utf-8", "surrogateescape")
             # Like GNU tar and libarchive, ustar headers have a name prefix, whatever their
             # version. Other headers have times there (GNU incremental), which some readers
             # take for a prefix.
@@ -373,9 +381,9 @@ class TarReader:
                 # star's prefix is 131 bytes, followed by times, for some readers
                 if header[508:512] == b"tar\0" and 0 not in header[345:476]:
                     raise Error("Archive contains a star header with a long prefix")
-                prefix = _str(header[345:500])
+                prefix = header[345:500].split(b"\0", 1)[0]
                 if prefix:
-                    header_name = f"{prefix}/{header_name}"
+                    raw_name = prefix + b"/" + raw_name
             elif magic not in _OTHER_MAGICS:
                 # A damaged magic, or a version that readers take for ustar or not
                 raise Error(f"Archive contains a header with the magic {magic!r}")
@@ -383,27 +391,32 @@ class TarReader:
                 raise Error(
                     "Archive contains a name prefix in a header that is not ustar"
                 )
-            name = long_name if long_name is not None else pax.get("path", header_name)
-            # A name ends at its first NUL, but some readers keep what follows
-            if long_name is None and "path" not in pax and after_name.strip(b"\0"):
-                raise Error(f"Archive contains bytes after the NUL of the name {name}")
-            # Readers create a name that is not UTF-8 as it is, or replace its bytes, also
-            # where hdrcharset declares it
+            # Names that are not UTF-8 are refused, also where hdrcharset declares them
             if "hdrcharset" in pax:
                 raise Error(f"Archive contains the pax hdrcharset {pax['hdrcharset']}")
-            try:
-                name.encode("utf-8")
-            except UnicodeEncodeError:
-                raise Error(
-                    f"Archive contains a name that is not UTF-8 {name!r}"
-                ) from None
+            if long_name is None and "path" not in pax:
+                # A name ends at its first NUL, but some readers keep what follows
+                if after_name.strip(b"\0"):
+                    raise Error(
+                        f"Archive contains bytes after the NUL of the name {raw_name!r}"
+                    )
+                # Decoded once, as the common case
+                name = _name(raw_name)
+            else:
+                name = long_name if long_name is not None else pax["path"]
+                try:
+                    name.encode("utf-8")
+                except UnicodeEncodeError:
+                    raise Error(
+                        f"Archive contains a name that is not UTF-8 {name!r}"
+                    ) from None
             # A separator on Windows, and a character elsewhere
             if "\\" in name:
                 raise Error(f"Archive contains a backslash in the name {name}")
             if type == AREGTYPE:
                 # Old tar implementations write dirs as files named with a slash. tarfile
                 # looks for it in the name in the header, others in the final name.
-                slash = header_name.endswith("/")
+                slash = raw_name.endswith(b"/")
                 if slash != name.endswith("/"):
                     raise Error(f"Archive contains {name}, named like a directory once")
                 if slash:
