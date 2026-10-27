@@ -144,7 +144,8 @@ def supported(member: tarfile.TarInfo, raw: bytes) -> bool:
     has a pax size, and 0 as the size in its header, which readers that ignore the pax size read
     (F14). ustar/dirtype-with-size is a dir with a size, which readers skip or take for data
     (F33). The checksums of misc/regtype-*-signed-chksum-* only match as the sum of signed
-    bytes, which some readers refuse (F06)."""
+    bytes, which some readers refuse (F06). Names that are not UTF-8 are created as they are or
+    with other bytes (N18)."""
     header = raw[member.offset_data - member.offset - 512 :][:512]
     return (
         member.type not in UNSUPPORTED
@@ -152,6 +153,7 @@ def supported(member: tarfile.TarInfo, raw: bytes) -> bool:
         and "size" not in member.pax_headers
         and not (member.isdir() and member.size)
         and unsigned_checksum(header)
+        and utf8(member)
     )
 
 
@@ -163,15 +165,10 @@ def utf8(member: tarfile.TarInfo) -> bool:
         return False
 
 
-def without_unsupported(data: bytes, extractable: bool = False) -> bytes:
-    """testtar.tar without sparse and special files, with every other header kept as is. To be
-    extractable, also without names that are not UTF-8, which macOS refuses."""
-    kept = b"".join(
-        raw
-        for member, raw in raw_members(data)
-        if supported(member, raw)
-        and (not extractable or sys.platform != "darwin" or utf8(member))
-    )
+def without_unsupported(data: bytes) -> bytes:
+    """testtar.tar without the members untar does not extract, with every other header kept
+    as is."""
+    kept = b"".join(raw for member, raw in raw_members(data) if supported(member, raw))
     return kept + bytes(1024)
 
 
@@ -213,7 +210,7 @@ def test_members_like_tarfile():
                 content,
             )
         )
-    assert len(actual) == len(expected) == 27
+    assert len(actual) == len(expected) == 24
     for a, e in zip(actual, expected):
         assert a == e, e[0]
 
@@ -228,7 +225,6 @@ def test_checksums():
             sums[m.name] = hashlib.sha256(b"".join(reader.chunks())).hexdigest()
     for name in [
         "ustar/regtype",
-        "ustar/umlauts-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
         "misc/regtype-old-v7",
         "misc/regtype-suntar",
         "misc/regtype-xstar",
@@ -261,6 +257,7 @@ def test_unsupported_members():
         "ustar/blktype",
         "ustar/chrtype",
         "ustar/fifotype",
+        "ustar/umlauts-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
         "gnu/sparse",
         "gnu/sparse-0.0",
         "gnu/sparse-0.1",
@@ -268,6 +265,8 @@ def test_unsupported_members():
         "misc/regtype-hpux-signed-chksum-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
         "misc/regtype-old-v7-signed-chksum-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
         "pax/regtype4",
+        "pax/bad-pax-\udce4\udcf6\udcfc",
+        "pax/hdrcharset-\udce4\udcf6\udcfc",
     ]
 
 
@@ -284,7 +283,7 @@ def test_ustar_sparse_is_a_regular_file():
 @needs_testdata
 def test_extract_like_tarfile(tmp_path):
     """Extracting gives the tree tarfile extracts, with names like ./x and long names."""
-    data = without_unsupported(read_testtar(), extractable=True)
+    data = without_unsupported(read_testtar())
     with tarfile.open(fileobj=io.BytesIO(data)) as tar:
         tar.extraction_filter = lambda member, path: member
         tar.extractall(tmp_path / "expected")
@@ -305,7 +304,7 @@ def test_gzip_and_stream(tmp_path):
     """GzipUstarReadTest and StreamReadTest: the same members from a gzipped, unseekable stream."""
     import gzip
 
-    data = without_unsupported(read_testtar(), extractable=True)
+    data = without_unsupported(read_testtar())
 
     class Stream:
         def __init__(self, data):
