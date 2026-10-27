@@ -351,6 +351,18 @@ def test_no_writes_over_symlinks(tmp_path):
     assert outside.read_text() == "original"
 
 
+def test_no_files_over_symlinks_to_nothing(tmp_path):
+    """S10: on Windows, os.open with O_EXCL creates the target of a symlink to nothing, and
+    O_NOFOLLOW does not exist. Files are created where nothing is, in one call."""
+    try:
+        os.symlink(tmp_path / "target", tmp_path / "link")
+    except OSError:
+        pytest.skip("cannot create symlinks")
+    with pytest.raises(FileExistsError):
+        untar._create(str(tmp_path / "link"), None, 0o644)
+    assert sorted(os.listdir(tmp_path)) == ["link"]
+
+
 @needs_symlinks
 def test_symlink_in_dest(tmp_path):
     """A symlink already in dest is not followed by members of that name."""

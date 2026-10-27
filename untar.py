@@ -16,6 +16,18 @@ import sys
 import zlib
 from typing import IO, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
+if sys.platform == "win32":
+    import _winapi
+    import msvcrt
+
+    # Arguments of CreateFile, which _winapi does not all have
+    _GENERIC_WRITE = 0x40000000
+    _FILE_SHARE_READ_WRITE = 0x1 | 0x2
+    _CREATE_NEW = 1
+    _FILE_ATTRIBUTE_READONLY = 0x1
+    _FILE_ATTRIBUTE_NORMAL = 0x80
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+
 __version__ = "0.2.0"
 __all__ = ["Error", "Member", "TarReader", "extract"]
 
@@ -580,6 +592,27 @@ _DEST_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
 _DIR_FLAGS = _DEST_FLAGS | _O_NOFOLLOW
 _FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_BINARY
 
+
+def _create(path: str, dir_fd: Optional[int], mode: int) -> int:
+    """Create a file and open it for writing, where nothing is, not even a symlink."""
+    if sys.platform == "win32":
+        # os.open has no O_NOFOLLOW there, and its O_EXCL creates the target of a symlink to
+        # nothing. CreateFile does not follow a symlink with FILE_FLAG_OPEN_REPARSE_POINT,
+        # and with CREATE_NEW fails on it as on any entry.
+        flags = _FILE_FLAG_OPEN_REPARSE_POINT | (
+            _FILE_ATTRIBUTE_NORMAL if mode & stat.S_IWRITE else _FILE_ATTRIBUTE_READONLY
+        )
+        handle = _winapi.CreateFile(
+            path, _GENERIC_WRITE, _FILE_SHARE_READ_WRITE, 0, _CREATE_NEW, flags, 0
+        )
+        try:
+            return msvcrt.open_osfhandle(handle, os.O_NOINHERIT)
+        except BaseException:
+            _winapi.CloseHandle(handle)
+            raise
+    return os.open(path, _FILE_FLAGS, mode, dir_fd=dir_fd)
+
+
 #: An open dir: a file descriptor, or a path where dir file descriptors are not supported
 Dir = Union[int, str]
 
@@ -727,7 +760,7 @@ class _Extractor:
         # Find out once what the filesystem does to new entries: mode bits the umask or default
         # ACLs strip, special bits it does not set, and the group they get.
         path, dir_fd = _at(self.tmp, "probe")
-        os.close(os.open(path, _FILE_FLAGS, file_mode, dir_fd=dir_fd))
+        os.close(_create(path, dir_fd, file_mode))
         s = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
         os.unlink(path, dir_fd=dir_fd)
         self.chown = gid is not None and s.st_gid != gid
@@ -848,10 +881,7 @@ class _Extractor:
         chunks: Iterable[Union[bytes, memoryview]],
     ) -> None:
         path, dir_fd = _at(parent, name)
-        # Without O_NOFOLLOW, as on Windows, O_EXCL creates the target of a symlink to nothing
-        if not _O_NOFOLLOW and _lstat(parent, name) is not None:
-            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), path)
-        fd = os.open(path, _FILE_FLAGS, mode, dir_fd=dir_fd)
+        fd = _create(path, dir_fd, mode)
         try:
             for data in chunks:
                 view = memoryview(data)
