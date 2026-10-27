@@ -775,7 +775,9 @@ class _Extractor:
             self.dest: Dir = os.dup(dest)
         else:
             os.makedirs(dest, exist_ok=True)
-            dest = os.path.abspath(dest)
+            # By path, every call resolves symlinks and junctions on it, which could be
+            # swapped: resolve them once
+            dest = os.path.realpath(dest) if _WINDOWS else os.path.abspath(dest)
             if _WINDOWS and not dest.startswith("\\\\?\\"):
                 # an extended-length path, which may exceed MAX_PATH
                 dest = "\\\\?\\" + dest
@@ -790,6 +792,14 @@ class _Extractor:
                 pass
         self.tmp_name = tmp_name
         self.tmp = _open_dir(self.dest, tmp_name)
+        if _WINDOWS:
+            # Pinning tmp keeps its ancestors in place, which are dirs if the path still
+            # resolves to itself, rather than through a symlink or junction swapped in
+            path, _ = _at(self.dest, tmp_name)
+            if os.path.normcase(os.path.realpath(path)) != os.path.normcase(path):
+                _close(self.tmp)
+                _rmdir(self.dest, tmp_name)
+                raise Error(f"Destination {dest} changed while it was opened")
 
         # Find out once what the filesystem does to new entries: mode bits the umask or default
         # ACLs strip, special bits it does not set, and the group they get.
