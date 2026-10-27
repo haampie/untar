@@ -133,42 +133,39 @@ def raw_members(data: bytes):
         yield member, data[member.offset : end]
 
 
-def unsigned_checksum(header: bytes) -> bool:
-    """Whether the checksum of a header is the sum of its bytes, as POSIX says."""
-    expected = int(header[148:156].strip(b" \0"), 8)
-    return expected == sum(header[:148]) + sum(header[156:]) + 256
-
-
-def supported(member: tarfile.TarInfo, raw: bytes) -> bool:
-    """Whether untar extracts a member, which it does not if tar-minefield rejects it. pax/regtype4
-    has a pax size, and 0 as the size in its header, which readers that ignore the pax size read
-    (F14). ustar/dirtype-with-size is a dir with a size, which readers skip or take for data
-    (F33). The checksums of misc/regtype-*-signed-chksum-* only match as the sum of signed
-    bytes, which some readers refuse (F06). Names that are not UTF-8 are created as they are or
-    with other bytes (N18)."""
-    header = raw[member.offset_data - member.offset - 512 :][:512]
-    return (
-        member.type not in UNSUPPORTED
-        and not member.issparse()
-        and "size" not in member.pax_headers
-        and not (member.isdir() and member.size)
-        and unsigned_checksum(header)
-        and utf8(member)
-    )
-
-
-def utf8(member: tarfile.TarInfo) -> bool:
-    try:
-        member.name.encode("utf-8")
-        return True
-    except UnicodeEncodeError:
-        return False
+#: The members that untar does not extract, in the order of the archive
+REJECTED = [
+    "ustar/conttype",
+    # A dir with a size, which readers skip or take for data (F33)
+    "ustar/dirtype-with-size",
+    "ustar/blktype",
+    "ustar/chrtype",
+    "ustar/fifotype",
+    # Names that are not UTF-8, which readers create as they are or with other bytes (N18)
+    "ustar/umlauts-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
+    "gnu/sparse",
+    "gnu/sparse-0.0",
+    "gnu/sparse-0.1",
+    "gnu/sparse-1.0",
+    # Checksums that only match as the sum of signed bytes, which some readers refuse (F06)
+    "misc/regtype-hpux-signed-chksum-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
+    "misc/regtype-old-v7-signed-chksum-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
+    # A pax size, and 0 as the size in its header, which readers that ignore the pax size
+    # read (F14)
+    "pax/regtype4",
+    # A pax path that is not UTF-8 (N18)
+    "pax/bad-pax-\udce4\udcf6\udcfc",
+    # Names that are not UTF-8 by hdrcharset (N24)
+    "pax/hdrcharset-\udce4\udcf6\udcfc",
+]
 
 
 def without_unsupported(data: bytes) -> bytes:
     """testtar.tar without the members untar does not extract, with every other header kept
     as is."""
-    kept = b"".join(raw for member, raw in raw_members(data) if supported(member, raw))
+    kept = b"".join(
+        raw for member, raw in raw_members(data) if member.name not in REJECTED
+    )
     return kept + bytes(1024)
 
 
@@ -244,30 +241,14 @@ def test_unsupported_members():
     rejects, are rejected, each in an archive of its own."""
     rejected = []
     for member, raw in raw_members(read_testtar()):
-        if supported(member, raw):
+        if member.name not in REJECTED:
             continue
         with pytest.raises(untar.Error):
             for m in untar.TarReader(io.BytesIO(raw + bytes(1024))):
                 if m.type in UNSUPPORTED:
                     raise untar.Error(f"unsupported {m.type!r}")
         rejected.append(member.name)
-    assert rejected == [
-        "ustar/conttype",
-        "ustar/dirtype-with-size",
-        "ustar/blktype",
-        "ustar/chrtype",
-        "ustar/fifotype",
-        "ustar/umlauts-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
-        "gnu/sparse",
-        "gnu/sparse-0.0",
-        "gnu/sparse-0.1",
-        "gnu/sparse-1.0",
-        "misc/regtype-hpux-signed-chksum-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
-        "misc/regtype-old-v7-signed-chksum-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
-        "pax/regtype4",
-        "pax/bad-pax-\udce4\udcf6\udcfc",
-        "pax/hdrcharset-\udce4\udcf6\udcfc",
-    ]
+    assert rejected == REJECTED
 
 
 @needs_testdata
