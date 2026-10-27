@@ -102,6 +102,7 @@ class Member:
 
 
 def _str(field: bytes) -> str:
+    """A field that ends at a NUL, such as a link target, which need not be UTF-8."""
     return field.split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
 
 
@@ -133,7 +134,7 @@ def _name(raw: bytes) -> str:
         raise Error(f"Archive contains a name that is not UTF-8 {raw!r}") from None
 
 
-def _long_name(data: bytes) -> str:
+def _long_name(data: bytes) -> bytes:
     """A GNU long name or link, which ends with NULs. Readers disagree on a NUL inside it: some
     stop there, others keep the rest."""
     name = data.rstrip(b"\0")
@@ -141,7 +142,7 @@ def _long_name(data: bytes) -> str:
         raise Error("Archive contains an empty GNU long name")
     if b"\0" in name:
         raise Error(f"Archive contains a GNU long name with a NUL inside {name!r}")
-    return name.decode("utf-8", "surrogateescape")
+    return name
 
 
 def _decimal(value: str, key: str) -> int:
@@ -152,8 +153,7 @@ def _decimal(value: str, key: str) -> int:
         not value
         or value.strip("0123456789")
         or len(value) > _MAX_DIGITS
-        or len(value) > 1
-        and value[0] == "0"
+        or (value[0] == "0" and len(value) > 1)
     ):
         raise Error(f"Archive contains an invalid pax {key} {value[:_MAX_DIGITS]!r}")
     return int(value)
@@ -353,26 +353,37 @@ class TarReader:
                         )
                     continue
                 kind = _PAX_HEADER if type == _SOLARIS_PAX_HEADER else type
-                if kind in seen:
+                # Not bytes in bytes, which is slow
+                if kind[0] in seen:
                     raise Error(f"Archive contains two {kind!r} headers for one member")
                 seen += kind
                 if kind == _PAX_HEADER:
                     pax = _pax_records(data)
                 elif kind == _GNU_LONGNAME:
-                    long_name = _long_name(data)
+                    long_name = _name(_long_name(data))
                 else:
-                    long_link = _long_name(data)
+                    long_link = _long_name(data).decode("utf-8", "surrogateescape")
             # Each extends the next header, and does not know the other: a GNU long name before
             # a pax header can apply to the pax header, and a pax size to a GNU long name.
-            if _PAX_HEADER in seen and (_GNU_LONGNAME in seen or _GNU_LONGLINK in seen):
+            if len(seen) > 1 and _PAX_HEADER in seen:
                 raise Error(
                     "Archive contains both a pax header and a GNU long name for one member"
                 )
-            for key in ("path", "linkpath"):
-                if key in pax and (not pax[key] or "\0" in pax[key]):
-                    raise Error(f"Archive contains an invalid pax {key} {pax[key]!r}")
+            if pax:
+                for key in ("path", "linkpath"):
+                    if key in pax and (not pax[key] or "\0" in pax[key]):
+                        raise Error(
+                            f"Archive contains an invalid pax {key} {pax[key]!r}"
+                        )
+                # Names that are not UTF-8 are refused, also where hdrcharset declares them
+                if "hdrcharset" in pax:
+                    raise Error(
+                        f"Archive contains the pax hdrcharset {pax['hdrcharset']}"
+                    )
+                if "path" in pax:
+                    _name(pax["path"].encode("utf-8", "surrogateescape"))
 
-            raw_name, _, after_name = header[0:100].partition(b"\0")
+            raw_name = header[0:100].rstrip(b"\0")
             # Like GNU tar and libarchive, ustar headers have a name prefix, whatever their
             # version. Other headers have times there (GNU incremental), which some readers
             # take for a prefix.
@@ -381,9 +392,8 @@ class TarReader:
                 # star's prefix is 131 bytes, followed by times, for some readers
                 if header[508:512] == b"tar\0" and 0 not in header[345:476]:
                     raise Error("Archive contains a star header with a long prefix")
-                prefix = header[345:500].split(b"\0", 1)[0]
-                if prefix:
-                    raw_name = prefix + b"/" + raw_name
+                if header[345]:
+                    raw_name = header[345:500].split(b"\0", 1)[0] + b"/" + raw_name
             elif magic not in _OTHER_MAGICS:
                 # A damaged magic, or a version that readers take for ustar or not
                 raise Error(f"Archive contains a header with the magic {magic!r}")
@@ -391,32 +401,24 @@ class TarReader:
                 raise Error(
                     "Archive contains a name prefix in a header that is not ustar"
                 )
-            # Names that are not UTF-8 are refused, also where hdrcharset declares them
-            if "hdrcharset" in pax:
-                raise Error(f"Archive contains the pax hdrcharset {pax['hdrcharset']}")
-            if long_name is None and "path" not in pax:
+            if long_name is not None:
+                name = long_name
+            elif "path" in pax:
+                name = pax["path"]
+            else:
                 # A name ends at its first NUL, but some readers keep what follows
-                if after_name.strip(b"\0"):
+                if 0 in raw_name:
                     raise Error(
                         f"Archive contains bytes after the NUL of the name {raw_name!r}"
                     )
-                # Decoded once, as the common case
                 name = _name(raw_name)
-            else:
-                name = long_name if long_name is not None else pax["path"]
-                try:
-                    name.encode("utf-8")
-                except UnicodeEncodeError:
-                    raise Error(
-                        f"Archive contains a name that is not UTF-8 {name!r}"
-                    ) from None
             # A separator on Windows, and a character elsewhere
             if "\\" in name:
                 raise Error(f"Archive contains a backslash in the name {name}")
             if type == AREGTYPE:
                 # Old tar implementations write dirs as files named with a slash. tarfile
                 # looks for it in the name in the header, others in the final name.
-                slash = raw_name.endswith(b"/")
+                slash = raw_name.partition(b"\0")[0].endswith(b"/")
                 if slash != name.endswith("/"):
                     raise Error(f"Archive contains {name}, named like a directory once")
                 if slash:
@@ -439,7 +441,10 @@ class TarReader:
                     )
                 size = pax_size
             if long_link is None:
-                long_link = pax.get("linkpath", _str(header[157:257]))
+                if "linkpath" in pax:
+                    long_link = pax["linkpath"]
+                else:
+                    long_link = _str(header[157:257]) if header[157] else ""
             # Readers that look at the link target rather than the type make a link of it
             if long_link and type != LNKTYPE and type != SYMTYPE:
                 raise Error(
@@ -687,7 +692,8 @@ class _Extractor:
         self.marker_name = root_marker
         #: The shallowest member with the marker name
         self.marker: Optional[List[str]] = None
-        #: Symlinks that could not be created, to their targets: copied once extracted
+        #: Symlinks that could not be created, to their targets: copied once extracted. They
+        #: are in copies too.
         self.links: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
         #: Symlinks that are copied, or are to be: nothing else is extracted at or below them,
         #: as nothing would be at or below a symlink
@@ -916,9 +922,10 @@ class _Extractor:
                         f"Archive contains symlink {member.name} to {member.linkname}, "
                         "which cannot be copied"
                     )
-                self.copies.add(tuple(parts))
+                key = tuple(parts)
+                self.copies.add(key)
                 if not self._copy(target, parts):
-                    self.links[tuple(parts)] = tuple(target)
+                    self.links[key] = tuple(target)
                 return
             if self.chown:
                 os.chown(path, -1, self.gid, dir_fd=dir_fd, follow_symlinks=False)  # type: ignore
@@ -928,8 +935,6 @@ class _Extractor:
             # replace, empty, or leave alone
             if source == parts:
                 raise Error(f"Archive hardlinks {member.name} to itself")
-            if tuple(source) in self.copies:
-                raise Error(f"Archive hardlinks {member.linkname}, which is a symlink")
             if not self._copy(source, parts, link=True):
                 raise Error(
                     f"Archive hardlinks {member.linkname}, which is not extracted"
@@ -957,6 +962,9 @@ class _Extractor:
         """Hardlink or copy an extracted entry to dest, and return whether it was extracted."""
         if not source:
             return False
+        if link and tuple(source) in self.copies:
+            # A copy of a symlink, which is a link to the symlink or to its target
+            raise Error(f"Archive hardlinks {'/'.join(source)}, which is a symlink")
         # Open dest's parent first, since that may close dirs on the stack that source reuses.
         parent = self._dir(dest[:-1])
         try:
