@@ -15,7 +15,7 @@ import posixpath
 import stat
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import pytest
 from test_untar import fail_with_eperm
@@ -41,11 +41,7 @@ DISAGREES = {
 }
 
 #: The same, only where links are not supported and untar copies their targets
-DISAGREES_WITHOUT_LINKS = {
-    "N07": "drops a symlink that it cannot copy",
-    "S10": "drops a symlink that it cannot copy, then writes a file in its place",
-    "S11": "drops a symlink that it cannot copy, then makes a directory in its place",
-}
+DISAGREES_WITHOUT_LINKS: Dict[str, str] = {}
 
 
 def manifest(case: str) -> dict:

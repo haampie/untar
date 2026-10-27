@@ -835,6 +835,32 @@ def test_links_are_copied_where_unsupported(tmp_path, monkeypatch, target_first)
     assert (tmp_path / "lib" / "sub").is_dir()
 
 
+@pytest.mark.parametrize("target", ["/abs", "../up", "missing", "s"])
+def test_symlinks_that_cannot_be_copied(tmp_path, monkeypatch, target):
+    """N07: rather than drop a symlink, which would leave its path to other members, refuse
+    it."""
+    monkeypatch.setattr(os, "symlink", fail_with_eperm)
+    members = [("f", "f", b"x", 0o644), ("s", "s", target, 0o777)]
+    with pytest.raises(untar.Error, match="symlink s to"):
+        untar.extract(io.BytesIO(make_tar(members)), str(tmp_path / "d"))
+    assert os.listdir(tmp_path / "d") == []
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [("s", "f", b"y", 0o644), ("s/x", "f", b"y", 0o644), ("s", "d", None, 0o755)],
+)
+@pytest.mark.parametrize("target", ["dir", "later"])
+def test_no_entries_at_or_below_copied_symlinks(tmp_path, monkeypatch, entry, target):
+    """S10, S11: nothing is created over or through a symlink, nor over or through its
+    copy, whether it is copied right away or after the last member."""
+    monkeypatch.setattr(os, "symlink", fail_with_eperm)
+    members = [("dir", "d", None, 0o755), ("s", "s", target, 0o777), entry]
+    with pytest.raises(untar.Error, match="at or below the symlink s"):
+        untar.extract(io.BytesIO(make_tar(members)), str(tmp_path / "d"))
+    assert os.listdir(tmp_path / "d") == []
+
+
 def test_symlink_chains_are_copied_where_unsupported(tmp_path, monkeypatch):
     """A symlink to a symlink is copied after it, also where it comes first, as in sorted
     shared library chains. Links are copied in time linear in their number."""

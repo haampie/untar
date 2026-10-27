@@ -14,7 +14,7 @@ import os
 import stat
 import sys
 import zlib
-from typing import IO, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from typing import IO, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 __version__ = "0.2.0"
 __all__ = ["Error", "Member", "TarReader", "extract"]
@@ -679,6 +679,9 @@ class _Extractor:
         self.marker: Optional[List[str]] = None
         #: Symlinks that could not be created, to their targets: copied once extracted
         self.links: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
+        #: Symlinks that are copied, or are to be: nothing else is extracted at or below them,
+        #: as nothing would be at or below a symlink
+        self.copies: Set[Tuple[str, ...]] = set()
         #: The names of the dirs below tmp that lead to the current member
         self.names: List[str] = []
         #: The deepest of those dirs, at most _MAX_OPEN_DIRS, which are open
@@ -864,6 +867,13 @@ class _Extractor:
         self._track(member, parts)
         if not parts:
             return
+        if self.copies:
+            for i in range(1, len(parts) + 1):
+                if tuple(parts[:i]) in self.copies:
+                    raise Error(
+                        f"Archive contains {member.name} at or below the symlink "
+                        f"{'/'.join(parts[:i])}"
+                    )
         if not member.isdir() and member.name.endswith(("/", "/.")):
             raise Error(
                 f"Archive contains non-directory {member.name} named like a directory"
@@ -888,11 +898,16 @@ class _Extractor:
             except OSError as e:
                 if not _unsupported(e):
                     raise
-                # Like tarfile, copy the target instead where symlinks are not supported.
+                # Like tarfile, copy the target instead where symlinks are not supported, and
+                # rather than drop a symlink, refuse one that cannot be copied.
                 target = _resolve(parts, member.linkname)
-                if target is not None and not self._copy(target, parts):
-                    if tuple(parts) in self.links:
-                        raise Error(f"Archive contains {member.name} twice")
+                if target is None:
+                    raise Error(
+                        f"Archive contains symlink {member.name} to {member.linkname}, "
+                        "which cannot be copied"
+                    )
+                self.copies.add(tuple(parts))
+                if not self._copy(target, parts):
                     self.links[tuple(parts)] = tuple(target)
                 return
             if self.chown:
@@ -991,7 +1006,11 @@ class _Extractor:
                 link = chain[-1][1]
                 chain.append((link, self.links.pop(link)))
             for link, target in reversed(chain):
-                self._copy(list(target), list(link))
+                if not self._copy(list(target), list(link)):
+                    raise Error(
+                        f"Archive contains symlink {'/'.join(link)} to "
+                        f"{'/'.join(target)}, which is not extracted"
+                    )
 
         src = self._dir(root)
         names = os.listdir(src)
