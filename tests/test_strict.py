@@ -151,9 +151,11 @@ def test_pax_numbers_with_many_digits(tmp_path, records):
     )
 
 
-def test_pax_numbers_with_zero_padding():
-    archive = extended(b"x", record("size", "0" * 21 + "3")) + member("f", b"abc") + EOF
-    assert members(archive) == [("f", "", 3)]
+@pytest.mark.parametrize("size", ["03", "00", "0" * 21 + "3"])
+def test_pax_numbers_with_zero_padding(tmp_path, size):
+    """F26: a leading zero, which some implementations take for octal."""
+    archive = extended(b"x", record("size", size)) + member("f", b"abc") + EOF
+    rejects(archive, tmp_path, "invalid pax size")
 
 
 def test_valid_numbers():
@@ -205,6 +207,16 @@ def test_checksum_variants(format):
     assert members(h + data(b"abc") + EOF) == [("f", "", 3)]
 
 
+def test_signed_checksum():
+    """F06: the signed sum of the bytes, which some old tar implementations wrote, and
+    others refuse."""
+    h = bytearray(header("f", size=3))
+    h[265:270] = b"\xe9" * 5
+    signed = checksum(h, lambda total: b"%06o\0 " % (total - 256 * 5))
+    with pytest.raises(untar.Error, match="checksum"):
+        members(signed + data(b"abc") + EOF)
+
+
 def test_invalid_checksum(tmp_path):
     data = bytearray(make_tar([("file", "f", b"x", 0o644)], tarfile.USTAR_FORMAT))
     data[0] ^= 1
@@ -243,6 +255,25 @@ def test_invalid_pax_records(tmp_path, records):
     rejects(extended(b"x", records) + member() + EOF, tmp_path, "invalid pax")
 
 
+@pytest.mark.parametrize("key", ["path", "comment", "mtime"])
+def test_newlines_in_pax_values(tmp_path, key):
+    """F13, F28: records are delimited by their length, but some implementations split them
+    on newlines, and see another record."""
+    archive = extended(b"x", record(key, "x\n12 size=512")) + member("f", b"abc") + EOF
+    rejects(archive, tmp_path, "newline")
+
+
+def test_newlines_in_xattrs(tmp_path):
+    """Except in xattrs, which some archives have, and which are not extracted."""
+    archive = (
+        extended(b"x", record("SCHILY.xattr.user.k", "a\nb"))
+        + member("f", b"abc")
+        + EOF
+    )
+    untar.extract(io.BytesIO(archive), str(tmp_path))
+    assert (tmp_path / "f").read_bytes() == b"abc"
+
+
 # Global pax headers
 
 
@@ -252,6 +283,18 @@ def test_global_pax_names_and_sizes(tmp_path, key):
     members."""
     archive = extended(b"g", record(key, "0")) + member("a", bytes(1024)) + EOF
     rejects(archive, tmp_path, "global pax")
+
+
+def test_global_pax_header_after_extended_header(tmp_path):
+    """F19: the extended header applies to the global header for some implementations, and
+    to the member for others."""
+    archive = (
+        extended(b"x", record("path", "a"))
+        + extended(b"g", record("comment", "hi"))
+        + member("f", b"x")
+        + EOF
+    )
+    rejects(archive, tmp_path, "global pax header after")
 
 
 def test_global_pax_other_keys(tmp_path):
@@ -264,11 +307,12 @@ def test_global_pax_other_keys(tmp_path):
 # Sizes of members without data, and of pax headers
 
 
-@pytest.mark.parametrize("type", [b"1", b"2", b"3", b"4", b"6"])
+@pytest.mark.parametrize("type", [b"1", b"2", b"3", b"4", b"5", b"6"])
 @pytest.mark.parametrize("pax", [False, True])
 def test_size_without_data(type, pax):
-    """F34, F35: tar and tarfile read what follows a link, device or fifo with a size as
-    headers, the Rust tar crates skip it as data: either could miss a member."""
+    """F33, F34, F35: tar and tarfile read what follows a link, device or fifo with a size
+    as headers, and skip the size of a dir; the Rust tar crates skip it as data, and some
+    implementations take the size of a dir for data: either could miss a member."""
     hidden = member("hidden", b"x")
     if pax:
         # Too large for the ustar size, which is 0 then
@@ -279,12 +323,6 @@ def test_size_without_data(type, pax):
         archive = header("f", type, size, "t")
     with pytest.raises(untar.Error, match=f"with size {size}"):
         members(archive + hidden + EOF)
-
-
-def test_dir_size_without_data():
-    """F33: some tar implementations give dirs a size, which tar and tarfile ignore."""
-    archive = header("d/", b"5", 512) + member("after", b"x") + EOF
-    assert members(archive) == [("d", "", 512), ("after", "", 1)]
 
 
 @pytest.mark.parametrize("pax_size,size", [(0, 1024), (1024, 0), (1024, 512)])
@@ -458,10 +496,13 @@ def test_two_extended_headers_of_a_kind(tmp_path, headers):
         extended(b"x", record("path", "a")) + extended(b"L", b"b\0"),
         extended(b"L", b"b\0") + extended(b"x", record("path", "a")),
         extended(b"x", record("linkpath", "a")) + extended(b"K", b"b\0"),
+        extended(b"L", b"b\0") + extended(b"x", record("mtime", "1")),
+        extended(b"x", record("size", "0")) + extended(b"L", b"b\0"),
     ],
 )
 def test_pax_and_gnu_names(tmp_path, headers):
-    """N08: a pax path and a GNU long name for one member."""
+    """N08, N23, F10: a pax header and a GNU long name or link for one member, whatever the
+    pax header has: each extends the next header, which may be the other."""
     rejects(headers + member("f", type=b"2", linkname="t") + EOF, tmp_path, "both")
 
 
@@ -474,6 +515,12 @@ def test_invalid_pax_names(tmp_path, key, value):
         extended(b"x", record(key, value)) + member("f", type=b"2", linkname="t") + EOF
     )
     rejects(archive, tmp_path, f"invalid pax {key}")
+
+
+def test_pax_key_twice(tmp_path):
+    """N20: implementations take the first or the last."""
+    archive = extended(b"x", record("path", "a") + record("path", "b")) + member() + EOF
+    rejects(archive, tmp_path, "twice")
 
 
 @pytest.mark.parametrize("type", [b"L", b"K"])
@@ -501,19 +548,27 @@ def test_empty_gnu_long_names(tmp_path, type):
     )
 
 
-@pytest.mark.parametrize("version", [b"00", b"\0\0", b" \0", b"  ", b"01"])
+@pytest.mark.parametrize("version", [b"00", b"\0\0"])
 def test_prefix_in_ustar_headers(version):
-    """F05, F11: implementations look at the magic "ustar\\0" and not at the version, which
-    some writers got wrong: a file in a dir would be extracted in the destination's top
-    level."""
+    """F05: the POSIX magic, with its version 00 or NULs as some Java archivers write it,
+    has a name prefix."""
     archive = member("name", prefix="prefix", magic=b"ustar\0" + version) + EOF
     assert members(archive) == [("prefix/name", "", 0)]
 
 
-@pytest.mark.parametrize("magic", [b"ustar  \0", b"ustar 00", b"ustarX00", bytes(8)])
+@pytest.mark.parametrize(
+    "magic", [b"ustar\0 \0", b"ustar\0  ", b"ustar\x0001", b"ustar 00", b"ustarX00"]
+)
+def test_other_magics(tmp_path, magic):
+    """F11: another version of the POSIX magic, or a damaged magic, which implementations
+    take for ustar, for v7, or not for a header: with a name prefix or not."""
+    rejects(member("name", magic=magic) + EOF, tmp_path, "magic")
+
+
+@pytest.mark.parametrize("magic", [b"ustar  \0", bytes(8)])
 def test_prefix_in_other_headers(tmp_path, magic):
     """N11: GNU incremental archives have times there, which some implementations take for a
-    prefix, as some do after any magic that starts with "ustar"."""
+    prefix."""
     assert members(member("name", magic=magic) + EOF) == [("name", "", 0)]
     rejects(member("name", prefix="prefix", magic=magic) + EOF, tmp_path, "not ustar")
 

@@ -36,18 +36,10 @@ REJECTED = {
 
 #: Cases where untar does not do as the verdict says, by identifier: to fix in untar
 DISAGREES = {
-    "F06": "accepts a checksum that only matches as the signed sum",
-    "F11": "accepts the POSIX magic with any version",
-    "F13": "accepts a newline in a pax path",
-    "F19": "applies a pax header across a global header, to the member",
-    "F28": "accepts a newline in a pax comment",
-    "F33": "skips the size of a directory, like GNU tar and tarfile",
     "K02": "accepts a linkname on a regular file",
     "N13": "accepts a backslash in a name",
     "N14": "accepts bytes after the NUL that ends a name",
     "N18": "accepts a name that is not UTF-8",
-    "N20": "takes the last of a key repeated in a pax header",
-    "N23": "applies a GNU long name across a pax header, to the member",
     "N24": "accepts hdrcharset=BINARY, and a pax path that is not UTF-8",
     "S04": "accepts a hardlink to itself, as tar cf a.tar f f writes",
     "S06": "accepts a hardlink to a symlink",
