@@ -39,6 +39,11 @@ restore them: files are created with `file_mode` (without executable bits where 
 has none for the owner), dirs with `dir_mode`, optionally with group `gid`, and only regular
 files, dirs, symlinks and hardlinks are extracted.
 
+Files get the time they are extracted, unless `mtime` gives them all one modification time, at
+the cost of a syscall per file. Pass it for autotools tarballs, where `configure` would otherwise
+be older than `configure.ac` and make would run autoconf again; a fixed value makes extractions
+reproducible.
+
 ## Features
 
 - Streaming: the archive is read front to back once, without seeking, from a file, pipe or
