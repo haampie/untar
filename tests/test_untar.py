@@ -287,8 +287,8 @@ def test_no_writes_through_symlinks(tmp_path, target):
 
 @needs_symlinks
 def test_no_writes_through_hardlinked_symlink(tmp_path):
-    """S06: a hardlink to a symlink pointing outside links the symlink, and nothing writes
-    into it."""
+    """S06: a hardlink to a symlink pointing outside is refused, and nothing writes into
+    it."""
     outside = tmp_path / "outside"
     outside.write_text("original")
     members = [
@@ -296,7 +296,7 @@ def test_no_writes_through_hardlinked_symlink(tmp_path):
         ("hard", "h", "link", 0o777),
         ("hard", "f", b"overwritten", 0o644),
     ]
-    with pytest.raises(FileExistsError):
+    with pytest.raises(untar.Error, match="which is a symlink"):
         untar.extract(io.BytesIO(make_tar(members)), str(tmp_path / "dest"))
     assert outside.read_text() == "original"
 
@@ -859,6 +859,17 @@ def test_no_entries_at_or_below_copied_symlinks(tmp_path, monkeypatch, entry, ta
     with pytest.raises(untar.Error, match="at or below the symlink s"):
         untar.extract(io.BytesIO(make_tar(members)), str(tmp_path / "d"))
     assert os.listdir(tmp_path / "d") == []
+
+
+@pytest.mark.parametrize("target_first", [False, True])
+def test_no_hardlinks_to_copied_symlinks(tmp_path, monkeypatch, target_first):
+    """S06: nor to a copy of a symlink."""
+    monkeypatch.setattr(os, "symlink", fail_with_eperm)
+    target = [("f", "f", b"x", 0o644)]
+    members = [("s", "s", "f", 0o777), ("h", "h", "s", 0o644)]
+    members = target + members if target_first else members[:1] + target + members[1:]
+    with pytest.raises(untar.Error, match="which is a symlink"):
+        untar.extract(io.BytesIO(make_tar(members)), str(tmp_path / "d"))
 
 
 def test_symlink_chains_are_copied_where_unsupported(tmp_path, monkeypatch):

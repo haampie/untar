@@ -567,12 +567,8 @@ def test_chains(outerdir):
     arc.add("targetdir/target", content="abc")
     arc.add("linkdir/hardlink", hardlink_to=os.path.join("targetdir", "target"))
     arc.add("linkdir/hardlink2", hardlink_to=os.path.join("linkdir", "symlink"))
-    assert extract(arc, outerdir) is None
-    dest = outerdir / "dest"
-    assert (dest / "linkdir" / "hardlink").read_text() == "abc"
-    # a hardlink to a symlink is the symlink, not its target
-    assert os.readlink(dest / "linkdir" / "hardlink2") == "hardlink"
-    assert (dest / "symlink2").read_text() == "abc"
+    # A hardlink to a symlink is the symlink or its target (S06)
+    rejected(extract(arc, outerdir), match="which is a symlink")
 
 
 @needs_symlinks
@@ -589,12 +585,11 @@ def test_sneaky_hardlink_fallback(outerdir):
 
 @needs_symlinks
 def test_sneaky_hardlink_fallback_deep(outerdir):
-    """The hardlink is the symlink, at another depth: it points outside, and is not followed."""
+    """The hardlink would be the symlink at another depth, or its target (S06)."""
     arc = ArchiveMaker()
     arc.add("a/b/s", symlink_to=os.path.join("..", "escape"))
     arc.add("s", hardlink_to=os.path.join("a", "b", "s"))
-    assert extract(arc, outerdir) is None
-    assert os.readlink(outerdir / "dest" / "s") == "../escape"
+    rejected(extract(arc, outerdir), match="which is a symlink")
 
 
 @needs_symlinks
@@ -603,8 +598,7 @@ def test_sneaky_hardlink_relocation(outerdir):
     arc.add("a/escape", content="decoy")
     arc.add("a/b/s", symlink_to=os.path.join("..", "escape"))
     arc.add("s", hardlink_to=os.path.join("a", "b", "s"))
-    assert extract(arc, outerdir) is None
-    assert (outerdir / "dest" / "a" / "escape").read_text() == "decoy"
+    rejected(extract(arc, outerdir), match="which is a symlink")
 
 
 @needs_symlinks
