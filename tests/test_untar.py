@@ -395,6 +395,35 @@ def test_no_entries_through_junctions(tmp_path):
         untar._open_dir(str(tmp_path), "junction")
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="junctions are of Windows")
+def test_dest_junction(tmp_path):
+    """dest may lead through a junction, which is resolved once, rather than by every
+    call."""
+    import _winapi
+
+    (tmp_path / "real").mkdir()
+    _winapi.CreateJunction(str(tmp_path / "real"), str(tmp_path / "junction"))
+    untar.extract(io.BytesIO(make_tar(SAMPLE[:3])), str(tmp_path / "junction"))
+    assert (tmp_path / "real" / "pkg" / "bin" / "app").read_bytes() == b"#!/bin/sh\n"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="dests are resolved on Windows")
+def test_dest_swapped_while_opened(tmp_path, monkeypatch):
+    """If the path to tmp no longer resolves to itself once tmp is pinned, a dir on it was
+    swapped for a junction or symlink."""
+    realpath = os.path.realpath
+    calls = []
+
+    def swapped(path):
+        calls.append(path)
+        return realpath(path) if len(calls) == 1 else str(tmp_path / "elsewhere")
+
+    monkeypatch.setattr(os.path, "realpath", swapped)
+    with pytest.raises(untar.Error, match="changed while it was opened"):
+        untar.extract(io.BytesIO(make_tar(SAMPLE[:3])), str(tmp_path / "dest"))
+    assert os.listdir(tmp_path / "dest") == []
+
+
 @needs_symlinks
 def test_symlink_in_dest(tmp_path):
     """A symlink already in dest is not followed by members of that name."""

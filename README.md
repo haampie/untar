@@ -118,8 +118,14 @@ Absolute names and `..` are rejected, dirs are opened with `O_NOFOLLOW` so nothi
 through a symlink, and files are created with `O_EXCL | O_NOFOLLOW` so existing entries are never
 replaced. Symlinks may point anywhere, but untar never follows them, except where the destination
 itself is one. The destination can also be an open dir file descriptor, so that a caller who
-opened it safely extracts into that very dir. On Windows, which has no dir file descriptors, these
-checks are path based and not safe against concurrent changes.
+opened it safely extracts into that very dir.
+
+On Windows, which has no dir file descriptors, entries are created by path. Every dir leading to
+the current member is held open without sharing delete access, so that neither it nor its
+ancestors can be renamed or removed, and none can be swapped for a symlink or junction while it is
+in use. Files are created with `CREATE_NEW` and `FILE_FLAG_OPEN_REPARSE_POINT`, the counterpart of
+`O_EXCL | O_NOFOLLOW`, and symlinks and junctions on the path to the destination are resolved
+once (from Python 3.8 on, whose `realpath` resolves them on Windows).
 
 Parsing is relatively strict: the idea is to reject tar files that would extract differently
 under tar implementations with more lenient parsing. Numbers must be plain digits, a member's name
