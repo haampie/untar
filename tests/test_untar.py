@@ -251,6 +251,7 @@ def test_member_order_does_not_matter(tmp_path):
     "name", ["/etc/passwd", "../passwd", "a/../../passwd", "a/../../../passwd"]
 )
 def test_unsafe_names(tmp_path, name):
+    """N12, N16: absolute names, and names with .."""
     dest = tmp_path / "dest"
     with pytest.raises(untar.Error, match="unsafe path"):
         untar.extract(io.BytesIO(make_tar([(name, "f", b"x", 0o644)])), str(dest))
@@ -259,7 +260,7 @@ def test_unsafe_names(tmp_path, name):
 
 @pytest.mark.parametrize("name", ["...", "d/...", "d/....", "d/..x", "d/x.."])
 def test_names_of_dots(tmp_path, name):
-    """Only . and .. are special."""
+    """Only . and .. are special: see N05 for ."""
     untar.extract(io.BytesIO(make_tar([(name, "f", b"x", 0o644)])), str(tmp_path))
     path = str(tmp_path / name)
     if sys.platform == "win32":
@@ -272,7 +273,7 @@ def test_names_of_dots(tmp_path, name):
 @needs_symlinks
 @pytest.mark.parametrize("target", ["/tmp", "..", "sub"])
 def test_no_writes_through_symlinks(tmp_path, target):
-    """A member below a symlink is not written through it, wherever it points."""
+    """S11: a member below a symlink is not written through it, wherever it points."""
     dest = tmp_path / "dest"
     members = [
         ("sub", "d", None, 0o755),
@@ -286,7 +287,8 @@ def test_no_writes_through_symlinks(tmp_path, target):
 
 @needs_symlinks
 def test_no_writes_through_hardlinked_symlink(tmp_path):
-    """A hardlink to a symlink pointing outside links the symlink, and nothing writes into it."""
+    """S06: a hardlink to a symlink pointing outside links the symlink, and nothing writes
+    into it."""
     outside = tmp_path / "outside"
     outside.write_text("original")
     members = [
@@ -333,7 +335,7 @@ def test_no_entries_through_symlinks(tmp_path, kind):
 
 @needs_symlinks
 def test_no_writes_over_symlinks(tmp_path):
-    """A file after a symlink of the same name does not write through it."""
+    """S10: a file after a symlink of the same name does not write through it."""
     outside = tmp_path / "outside"
     outside.write_text("original")
     members = [("f", "s", str(outside), 0o777), ("f", "f", b"overwritten", 0o644)]
@@ -373,7 +375,8 @@ def folds(path, a: str, b: str) -> bool:
 @pytest.mark.parametrize("kind", ["f", "d", "s", "h", "target"])
 def test_names_that_fold(tmp_path, link, name, kind):
     """On filesystems that ignore case or normalize Unicode, like those of macOS and
-    Windows, another name may lead through a symlink. Neither entries below it nor
+    Windows, another name may lead through a symlink: in tar-minefield, a failure specific to
+    a platform rather than an ambiguity. Neither entries below it nor
     hardlink targets go through it."""
     if not folds(tmp_path, link, name):
         pytest.skip(f"the filesystem tells {link!r} and {name!r} apart")
@@ -573,6 +576,7 @@ def test_dir_fd_needs_every_call(monkeypatch, supports):
 
 
 def test_no_overwrites(tmp_path):
+    """S07, S09: the same file twice."""
     members = [("file", "f", b"first", 0o644), ("file", "f", b"second", 0o644)]
     with pytest.raises(FileExistsError):
         untar.extract(io.BytesIO(make_tar(members)), str(tmp_path / "dest"))
@@ -588,7 +592,8 @@ LISTED_ONCE = [
 
 @needs_symlinks
 def test_listed_twice(tmp_path):
-    """tar archives an entry listed twice as a hardlink to itself, symlinks included."""
+    """S02, S04: tar archives an entry listed twice as a hardlink to itself, symlinks
+    included."""
     again = [(name, "h", name, mode) for name, kind, _, mode in LISTED_ONCE[1:]]
     data = make_tar(LISTED_ONCE + LISTED_ONCE[:1] + again)
     untar.extract(io.BytesIO(data), str(tmp_path / "actual"))
@@ -667,81 +672,6 @@ def test_special_modes_are_not_restored(tmp_path):
     untar.extract(io.BytesIO(data), str(tmp_path))
     assert stat.S_IMODE(os.stat(tmp_path / "suid").st_mode) == 0o755
     assert stat.S_IMODE(os.stat(tmp_path / "dir").st_mode) == 0o755
-
-
-def test_large_extended_header(tmp_path):
-    data = make_tar([("x" * (2 * 1024 * 1024), "f", b"", 0o644)], tarfile.GNU_FORMAT)
-    with pytest.raises(untar.Error, match="extended header"):
-        untar.extract(io.BytesIO(data), str(tmp_path))
-
-
-def test_invalid_checksum(tmp_path):
-    data = bytearray(make_tar([("file", "f", b"x", 0o644)], tarfile.USTAR_FORMAT))
-    data[0] ^= 1
-    with pytest.raises(untar.Error, match="checksum"):
-        untar.extract(io.BytesIO(bytes(data)), str(tmp_path))
-
-
-def test_truncated(tmp_path):
-    data = make_tar([("file", "f", os.urandom(5000), 0o644)])
-    with pytest.raises(untar.Error, match="truncated"):
-        untar.extract(io.BytesIO(data[:2000]), str(tmp_path))
-
-
-TWO_MEMBERS = make_tar(
-    [("a", "f", b"a", 0o644), ("b", "f", b"b", 0o644)], tarfile.USTAR_FORMAT
-)[: 4 * 512]
-
-
-@pytest.mark.parametrize(
-    "archive,error",
-    [
-        (TWO_MEMBERS, "truncated"),
-        (TWO_MEMBERS[:1024], "truncated"),
-        (TWO_MEMBERS + bytes(512), "truncated"),
-        (
-            TWO_MEMBERS[:1024] + bytes(512) + TWO_MEMBERS[1024:] + bytes(1024),
-            "lone zero block",
-        ),
-        (b"", "empty"),
-        (gzip.compress(b""), "empty"),
-    ],
-)
-def test_end_of_archive_marker(tmp_path, archive, error):
-    """Without two zero blocks at the end, truncation between members would go unnoticed."""
-    with pytest.raises(untar.Error, match=error):
-        untar.extract(io.BytesIO(archive), str(tmp_path / "d"))
-    assert os.listdir(tmp_path / "d") == []
-    untar.extract(io.BytesIO(TWO_MEMBERS + bytes(1024)), str(tmp_path / "d"))
-    assert sorted(os.listdir(tmp_path / "d")) == ["a", "b"]
-
-
-@pytest.mark.parametrize(
-    "archive",
-    [
-        TWO_MEMBERS + bytes(1024) + TWO_MEMBERS + bytes(1024),
-        TWO_MEMBERS + bytes(1024 + 2 * untar._BUF) + b"x",
-        gzip.compress(TWO_MEMBERS + bytes(1024))
-        + gzip.compress(TWO_MEMBERS + bytes(1024)),
-    ],
-    # Not the archives, which are too long for an environment variable on Windows
-    ids=["two archives", "data after 2 MiB of zeros", "two gzip files"],
-)
-def test_data_after_end_of_archive_marker(tmp_path, archive):
-    """Every reader ignores it, so a second archive after the first would go unnoticed."""
-    with pytest.raises(untar.Error, match="after the end-of-archive marker"):
-        untar.extract(io.BytesIO(archive), str(tmp_path / "d"))
-    assert os.listdir(tmp_path / "d") == []
-
-
-@pytest.mark.parametrize("compress", [False, True])
-def test_zeros_after_end_of_archive_marker(tmp_path, compress):
-    """Writers pad archives with zeros, to a multiple of the record size for example."""
-    archive = TWO_MEMBERS + bytes(1024 + 2 * untar._BUF + 7)
-    untar.extract(
-        ReadOnly(gzip.compress(archive) if compress else archive), str(tmp_path)
-    )
-    assert sorted(os.listdir(tmp_path)) == ["a", "b"]
 
 
 @needs_symlinks
@@ -945,5 +875,6 @@ def test_solaris_extended_header(tmp_path):
     ],
 )
 def test_no_entries_over_others(tmp_path, members):
+    """S08: one path as members of different kinds."""
     with pytest.raises((FileExistsError, untar.Error)):
         untar.extract(io.BytesIO(make_tar(members)), str(tmp_path))

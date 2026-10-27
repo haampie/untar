@@ -1,4 +1,9 @@
-"""Archives that untar rejects, or reads in one way only, where readers have disagreed."""
+"""Ambiguities: archives from which tar implementations extract different trees, which untar
+rejects, or reads in one way only.
+
+Grouped by the categories of tar-minefield: framing (F), names (N), kinds (K), and order and
+state (S). A docstring that starts with an identifier, such as F12, names the cases of its test
+suite that the test covers in more variants: test_minefield.py runs the cases themselves."""
 
 import errno
 import gzip
@@ -9,7 +14,7 @@ import sys
 import tarfile
 
 import pytest
-from test_untar import make_tar, needs_symlinks
+from test_untar import ReadOnly, make_tar, needs_symlinks
 
 import untar
 
@@ -76,6 +81,16 @@ def rejects(archive: bytes, tmp_path, match=None):
     assert os.listdir(tmp_path / "dest") == []
 
 
+def test_tarfile_reads_our_headers():
+    """The raw headers here are valid: tarfile agrees on the members of a simple archive."""
+    archive = member("a", b"x") + member("d/", type=b"5") + EOF
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        assert [(m.name, m.size) for m in tar] == [("a", 1), ("d", 0)]
+
+
+# Framing (F): where the data of a member ends and the next header begins, and which headers
+# belong to a member.
+
 # Numbers: octal and pax decimal, in ASCII digits only.
 
 
@@ -83,6 +98,8 @@ def rejects(archive: bytes, tmp_path, match=None):
     "size", [b"-1777", b"+17", b"0o17", b"0_17", b"1 7", b"\xd9\xa3"]
 )
 def test_invalid_octal_numbers(tmp_path, size):
+    """F12: a sign, a prefix, an underscore, a space between digits, digits other than
+    ASCII."""
     archive = header(size=size) + member("secret", b"hello") + EOF
     with pytest.raises(untar.Error, match="invalid number"):
         members(archive)
@@ -102,9 +119,9 @@ def test_invalid_octal_numbers(tmp_path, size):
     ],
 )
 def test_octal_numbers_with_odd_padding(size):
-    """Readers disagree on the size of a member, and so on where the next header is: some
-    skip a leading NUL or whitespace other than spaces, others stop there, and some read
-    the digits after a NUL."""
+    """Implementations disagree on the size of a member, and so on where the next header
+    is: some skip a leading NUL or whitespace other than spaces, others stop there, and some
+    read the digits after a NUL."""
     with pytest.raises(untar.Error, match="invalid number"):
         members(header(size=size) + member("hidden", bytes(1024)) + EOF)
 
@@ -113,6 +130,7 @@ def test_octal_numbers_with_odd_padding(size):
     "size", ["", "abc", "-1536", "1_0", "+3", " 3", "٣", "0x3", "3.0"]
 )
 def test_invalid_pax_sizes(tmp_path, size):
+    """F21 to F25: an empty pax size, a sign, a leading space, digits other than ASCII."""
     archive = extended(b"x", record("size", size)) + member("f", b"abc") + EOF
     rejects(archive, tmp_path, "invalid pax size")
 
@@ -139,7 +157,7 @@ def test_pax_numbers_with_zero_padding():
 
 
 def test_valid_numbers():
-    """Leading and trailing spaces and NULs, octal without terminator, and base-256."""
+    """F01: leading and trailing spaces and NULs, octal without terminator, and base-256."""
     for size in [
         b"  3",
         b"3 ",
@@ -149,6 +167,16 @@ def test_valid_numbers():
         b"\x80" + (3).to_bytes(11, "big"),
     ]:
         assert members(header(size=size) + data(b"abc") + EOF) == [("f", "", 3)]
+
+
+def test_negative_sizes():
+    """F29: a negative size would move a reader back, maybe in circles."""
+    size = b"\xff" * 11 + b" "
+    with pytest.raises(untar.Error, match="negative"):
+        members((header(size=size) + data(b"abc")) * 3 + EOF)
+
+
+# Checksums
 
 
 @pytest.mark.parametrize(
@@ -161,8 +189,8 @@ def test_valid_numbers():
     ids=["base-256", "garbage", "tab"],
 )
 def test_odd_checksums(field):
-    """Readers that refuse a checksum skip to the next block that is a valid header, which
-    may be in the data of this member."""
+    """Implementations that refuse a checksum skip to the next block that is a valid header,
+    which may be in the data of this member."""
     archive = checksum(header("f", size=1024), field) + member("hidden", bytes(1024))
     with pytest.raises(untar.Error, match="invalid number"):
         members(archive + EOF)
@@ -172,9 +200,16 @@ def test_odd_checksums(field):
     "format", [b"%06o\0 ", b"%06o \0", b"%07o\0", b"%08o", b" %06o\0"]
 )
 def test_checksum_variants(format):
-    """Space or NUL terminated, unterminated, and with leading spaces."""
+    """F32: space or NUL terminated, unterminated, and with leading spaces."""
     h = checksum(header("f", size=3), lambda total: format % total)
     assert members(h + data(b"abc") + EOF) == [("f", "", 3)]
+
+
+def test_invalid_checksum(tmp_path):
+    data = bytearray(make_tar([("file", "f", b"x", 0o644)], tarfile.USTAR_FORMAT))
+    data[0] ^= 1
+    with pytest.raises(untar.Error, match="checksum"):
+        untar.extract(io.BytesIO(bytes(data)), str(tmp_path))
 
 
 # Pax records
@@ -189,101 +224,51 @@ def test_checksum_variants(format):
         b"9path=x\n",
         b"30 path=x\n",
         b"0 path=x\n",
-        # Leading zeros: some readers find the end of a record from the length as written
+        # Leading zeros: some implementations find the end of a record from the length as
+        # written
         b"011 path=x\n",
-        # A NUL or blanks in a key: readers stop there, skip the key, or skip the blanks
+        # A NUL or blanks in a key: implementations stop there, skip the key, or skip the
+        # blanks
         record("a\0b", "c") + record("size", "0"),
         record(" size", "0"),
         record("\tpath", "x"),
-        # Records that do not fill the header: readers stop at a NUL, or skip the record
+        # Records that do not fill the header: implementations stop at a NUL, or skip the
+        # record
         record("path", "x") + b"\0",
         record("path", "x") + b"\0" + record("path", "y"),
     ],
 )
 def test_invalid_pax_records(tmp_path, records):
+    """F36: a length that does not count the whole record, and others."""
     rejects(extended(b"x", records) + member() + EOF, tmp_path, "invalid pax")
 
 
-@pytest.mark.parametrize(
-    "key,value", [("path", ""), ("linkpath", ""), ("path", "a\0b")]
-)
-def test_invalid_pax_names(tmp_path, key, value):
-    archive = (
-        extended(b"x", record(key, value)) + member("f", type=b"2", linkname="t") + EOF
-    )
-    rejects(archive, tmp_path, f"invalid pax {key}")
+# Global pax headers
 
 
 @pytest.mark.parametrize("key", ["path", "linkpath", "size"])
 def test_global_pax_names_and_sizes(tmp_path, key):
-    """Readers disagree on whether global names and sizes apply to later members."""
+    """F20, N21: implementations disagree on whether global names and sizes apply to later
+    members."""
     archive = extended(b"g", record(key, "0")) + member("a", bytes(1024)) + EOF
     rejects(archive, tmp_path, "global pax")
 
 
 def test_global_pax_other_keys(tmp_path):
+    """F17: the comment that git archive writes."""
     archive = extended(b"g", record("comment", "hi")) + member("a", b"x") + EOF
     untar.extract(io.BytesIO(archive), str(tmp_path))
     assert (tmp_path / "a").read_bytes() == b"x"
 
 
-# One name per member: readers resolve these conflicts differently.
-
-
-@pytest.mark.parametrize(
-    "headers",
-    [
-        extended(b"x", record("path", "a")) + extended(b"x", record("path", "b")),
-        extended(b"x", record("path", "a")) + extended(b"X", record("size", "1")),
-        extended(b"L", b"a\0") + extended(b"L", b"b\0"),
-        extended(b"K", b"a\0") + extended(b"K", b"b\0"),
-    ],
-)
-def test_two_extended_headers_of_a_kind(tmp_path, headers):
-    rejects(headers + member("f", type=b"2", linkname="t") + EOF, tmp_path, "two")
-
-
-@pytest.mark.parametrize(
-    "headers",
-    [
-        extended(b"x", record("path", "a")) + extended(b"L", b"b\0"),
-        extended(b"L", b"b\0") + extended(b"x", record("path", "a")),
-        extended(b"x", record("linkpath", "a")) + extended(b"K", b"b\0"),
-    ],
-)
-def test_pax_and_gnu_names(tmp_path, headers):
-    rejects(headers + member("f", type=b"2", linkname="t") + EOF, tmp_path, "both")
-
-
-@pytest.mark.parametrize("type", [b"x", b"L", b"K"])
-@pytest.mark.parametrize("end", [b"", EOF])
-def test_extended_header_without_member(tmp_path, type, end):
-    """Dropping it silently would hide truncation."""
-    content = record("path", "a") if type == b"x" else b"a\0"
-    match = "ends after" if end else "truncated"
-    rejects(member("first") + extended(type, content) + end, tmp_path, match)
-
-
-@pytest.mark.parametrize("type", [b"L", b"K"])
-def test_gnu_long_names_with_nul_inside(tmp_path, type):
-    """Readers that stop at the NUL and readers that keep the rest see different names."""
-    rejects(
-        extended(type, b"good\0bad\0") + member("f", type=b"2", linkname="t") + EOF,
-        tmp_path,
-        "NUL inside",
-    )
-
-
-def test_gnu_long_names_end_with_nuls():
-    archive = extended(b"L", b"name\0\0") + member("f", type=b"2", linkname="t") + EOF
-    assert members(archive) == [("name", "t", 0)]
+# Sizes of members without data, and of pax headers
 
 
 @pytest.mark.parametrize("type", [b"1", b"2", b"3", b"4", b"6"])
 @pytest.mark.parametrize("pax", [False, True])
 def test_size_without_data(type, pax):
-    """tar and tarfile read what follows a link, device or fifo with a size as headers, the
-    Rust tar crates skip it as data: either could miss a member."""
+    """F34, F35: tar and tarfile read what follows a link, device or fifo with a size as
+    headers, the Rust tar crates skip it as data: either could miss a member."""
     hidden = member("hidden", b"x")
     if pax:
         # Too large for the ustar size, which is 0 then
@@ -297,99 +282,15 @@ def test_size_without_data(type, pax):
 
 
 def test_dir_size_without_data():
-    """Some tar implementations give dirs a size, which tar and tarfile ignore."""
+    """F33: some tar implementations give dirs a size, which tar and tarfile ignore."""
     archive = header("d/", b"5", 512) + member("after", b"x") + EOF
     assert members(archive) == [("d", "", 512), ("after", "", 1)]
 
 
-@pytest.mark.parametrize("type", [b"L", b"K"])
-def test_empty_gnu_long_names(tmp_path, type):
-    rejects(
-        extended(type, b"\0") + member("f", type=b"2", linkname="t") + EOF,
-        tmp_path,
-        "empty",
-    )
-
-
-def test_extended_headers_are_limited_per_member(tmp_path):
-    big = "x" * (600 * 1024)
-    archive = extended(b"L", big.encode() + b"\0") + extended(
-        b"x", record("linkpath", big)
-    )
-    rejects(archive + member("f", type=b"1") + EOF, tmp_path, "more than 1 MiB")
-
-
-def test_negative_sizes():
-    """A negative size would move a reader back, maybe in circles."""
-    size = b"\xff" * 11 + b" "
-    with pytest.raises(untar.Error, match="negative"):
-        members((header(size=size) + data(b"abc")) * 3 + EOF)
-
-
-# Reading
-
-
-def test_unknown_types_have_data():
-    """Like tarfile: the reader does not lose its place on a type it does not know."""
-    archive = (
-        member("mystery", b"DATA" * 200, type=b"Z") + member("after", b"after") + EOF
-    )
-    assert [name for name, _, _ in members(archive)] == ["mystery", "after"]
-
-
-@pytest.mark.parametrize("version", [b"00", b"\0\0", b" \0", b"  ", b"01"])
-def test_prefix_in_ustar_headers(version):
-    """Readers look at the magic "ustar\\0" and not at the version, which some writers got
-    wrong: a file in a dir would be extracted in the destination's top level."""
-    archive = member("name", prefix="prefix", magic=b"ustar\0" + version) + EOF
-    assert members(archive) == [("prefix/name", "", 0)]
-
-
-@pytest.mark.parametrize("magic", [b"ustar  \0", b"ustar 00", b"ustarX00", bytes(8)])
-def test_prefix_in_other_headers(tmp_path, magic):
-    """GNU incremental archives have times there, which some readers take for a prefix,
-    as some do after any magic that starts with "ustar"."""
-    assert members(member("name", magic=magic) + EOF) == [("name", "", 0)]
-    rejects(member("name", prefix="prefix", magic=magic) + EOF, tmp_path, "not ustar")
-
-
-def test_star_prefix():
-    """star's prefix is 131 bytes, followed by times: some readers read only those, others
-    all 155."""
-    star = bytearray(header("name", prefix="p" * 131))
-    star[476:500] = b"14000000000\0" * 2
-    star[508:512] = b"tar\0"
-    with pytest.raises(untar.Error, match="star header"):
-        members(checksum(star) + EOF)
-    star[475] = 0
-    assert members(checksum(star) + EOF) == [("p" * 130 + "/name", "", 0)]
-
-
-@pytest.mark.parametrize(
-    "headers,name",
-    [
-        (extended(b"x", record("path", "file")), "dir/"),
-        (extended(b"L", b"file\0"), "dir/"),
-        (extended(b"x", record("path", "dir/")), "file"),
-    ],
-    ids=["pax path", "GNU long name", "pax dir"],
-)
-def test_old_dirs_named_like_dirs_once(tmp_path, headers, name):
-    """Old tar implementations write dirs as files named with a slash. Some readers look
-    for it in the name in the header, others in the final name: a file there has data, and
-    a dir has none, which is where the others see a member."""
-    archive = headers + header(name, b"\0", 1024) + member("hidden", bytes(1024)) + EOF
-    rejects(archive, tmp_path, "named like a directory")
-
-
-def test_old_dirs_named_like_dirs():
-    archive = extended(b"x", record("path", "long/")) + header("dir/", b"\0", 0) + EOF
-    assert members(archive) == [("long", "", 0)]
-
-
 @pytest.mark.parametrize("pax_size,size", [(0, 1024), (1024, 0), (1024, 512)])
 def test_pax_size_and_size(tmp_path, pax_size, size):
-    """Readers without pax support, or that ignore its size, use the size in the header."""
+    """F14, F15: implementations without pax support, or that ignore its size, use the size
+    in the header."""
     archive = (
         extended(b"x", record("size", str(pax_size)))
         + header("f", size=size)
@@ -411,23 +312,306 @@ def test_pax_sizes_for_large_files():
     assert members(archive) == [("f", "", 3)]
 
 
+# Types
+
+
+def test_unknown_types_have_data():
+    """F16: like tarfile, the reader does not lose its place on a type it does not know, and
+    extraction rejects it."""
+    archive = (
+        member("mystery", b"DATA" * 200, type=b"Z") + member("after", b"after") + EOF
+    )
+    assert [name for name, _, _ in members(archive)] == ["mystery", "after"]
+
+
 @pytest.mark.parametrize(
     "key,value", [("SCHILY.realsize", "10000"), ("SUN.holesdata", " 0 512")]
 )
 def test_sparse_pax_keys(tmp_path, key, value):
-    """Some readers make a sparse file of these, with other contents."""
+    """Some implementations make a sparse file of these, with other contents."""
     archive = extended(b"x", record(key, value)) + member("f", b"A" * 1024) + EOF
     rejects(archive, tmp_path, "sparse")
 
 
 def test_contiguous_files(tmp_path):
-    """Type 7 has data for most readers, but not for all."""
+    """Type 7 has data for most implementations, but not for all."""
     archive = member("f", b"x" * 1024, type=b"7") + member("after", b"y") + EOF
     assert [name for name, _, _ in members(archive)] == ["f", "after"]
     rejects(archive, tmp_path, "unsupported type")
 
 
-# gzip
+# Extended headers
+
+
+@pytest.mark.parametrize("type", [b"x", b"L", b"K"])
+@pytest.mark.parametrize("end", [b"", EOF])
+def test_extended_header_without_member(tmp_path, type, end):
+    """Dropping it silently would hide truncation."""
+    content = record("path", "a") if type == b"x" else b"a\0"
+    match = "ends after" if end else "truncated"
+    rejects(member("first") + extended(type, content) + end, tmp_path, match)
+
+
+def test_extended_headers_are_limited_per_member(tmp_path):
+    big = "x" * (600 * 1024)
+    archive = extended(b"L", big.encode() + b"\0") + extended(
+        b"x", record("linkpath", big)
+    )
+    rejects(archive + member("f", type=b"1") + EOF, tmp_path, "more than 1 MiB")
+
+
+def test_large_extended_header(tmp_path):
+    data = make_tar([("x" * (2 * 1024 * 1024), "f", b"", 0o644)], tarfile.GNU_FORMAT)
+    with pytest.raises(untar.Error, match="extended header"):
+        untar.extract(io.BytesIO(data), str(tmp_path))
+
+
+# The end of the archive
+
+
+def test_truncated(tmp_path):
+    """F08: an archive that ends in the data of a member."""
+    data = make_tar([("file", "f", os.urandom(5000), 0o644)])
+    with pytest.raises(untar.Error, match="truncated"):
+        untar.extract(io.BytesIO(data[:2000]), str(tmp_path))
+
+
+TWO_MEMBERS = make_tar(
+    [("a", "f", b"a", 0o644), ("b", "f", b"b", 0o644)], tarfile.USTAR_FORMAT
+)[: 4 * 512]
+
+
+@pytest.mark.parametrize(
+    "archive,error",
+    [
+        (TWO_MEMBERS, "truncated"),
+        (TWO_MEMBERS[:1024], "truncated"),
+        (TWO_MEMBERS + bytes(512), "truncated"),
+        (
+            TWO_MEMBERS[:1024] + bytes(512) + TWO_MEMBERS[1024:] + bytes(1024),
+            "lone zero block",
+        ),
+        (b"", "empty"),
+        (gzip.compress(b""), "empty"),
+    ],
+)
+def test_end_of_archive_marker(tmp_path, archive, error):
+    """F03, F04, F09: without two zero blocks at the end, truncation between members would
+    go unnoticed."""
+    with pytest.raises(untar.Error, match=error):
+        untar.extract(io.BytesIO(archive), str(tmp_path / "d"))
+    assert os.listdir(tmp_path / "d") == []
+    untar.extract(io.BytesIO(TWO_MEMBERS + bytes(1024)), str(tmp_path / "d"))
+    assert sorted(os.listdir(tmp_path / "d")) == ["a", "b"]
+
+
+@pytest.mark.parametrize(
+    "archive",
+    [
+        TWO_MEMBERS + bytes(1024) + TWO_MEMBERS + bytes(1024),
+        TWO_MEMBERS + bytes(1024 + 2 * untar._BUF) + b"x",
+        gzip.compress(TWO_MEMBERS + bytes(1024))
+        + gzip.compress(TWO_MEMBERS + bytes(1024)),
+    ],
+    # Not the archives, which are too long for an environment variable on Windows
+    ids=["two archives", "data after 2 MiB of zeros", "two gzip files"],
+)
+def test_data_after_end_of_archive_marker(tmp_path, archive):
+    """F07, and F02, which untar rejects too: every implementation ignores it, so a second
+    archive after the first would go unnoticed."""
+    with pytest.raises(untar.Error, match="after the end-of-archive marker"):
+        untar.extract(io.BytesIO(archive), str(tmp_path / "d"))
+    assert os.listdir(tmp_path / "d") == []
+
+
+@pytest.mark.parametrize("compress", [False, True])
+def test_zeros_after_end_of_archive_marker(tmp_path, compress):
+    """Writers pad archives with zeros, to a multiple of the record size for example."""
+    archive = TWO_MEMBERS + bytes(1024 + 2 * untar._BUF + 7)
+    untar.extract(
+        ReadOnly(gzip.compress(archive) if compress else archive), str(tmp_path)
+    )
+    assert sorted(os.listdir(tmp_path)) == ["a", "b"]
+
+
+# Names (N): which of several fields gives a member its name, and how it is normalized. One
+# name per member: implementations resolve conflicts between them differently.
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        extended(b"x", record("path", "a")) + extended(b"x", record("path", "b")),
+        extended(b"x", record("path", "a")) + extended(b"X", record("size", "1")),
+        extended(b"L", b"a\0") + extended(b"L", b"b\0"),
+        extended(b"K", b"a\0") + extended(b"K", b"b\0"),
+    ],
+)
+def test_two_extended_headers_of_a_kind(tmp_path, headers):
+    """N09: two pax headers, two GNU long names or two GNU long links for one member."""
+    rejects(headers + member("f", type=b"2", linkname="t") + EOF, tmp_path, "two")
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        extended(b"x", record("path", "a")) + extended(b"L", b"b\0"),
+        extended(b"L", b"b\0") + extended(b"x", record("path", "a")),
+        extended(b"x", record("linkpath", "a")) + extended(b"K", b"b\0"),
+    ],
+)
+def test_pax_and_gnu_names(tmp_path, headers):
+    """N08: a pax path and a GNU long name for one member."""
+    rejects(headers + member("f", type=b"2", linkname="t") + EOF, tmp_path, "both")
+
+
+@pytest.mark.parametrize(
+    "key,value", [("path", ""), ("linkpath", ""), ("path", "a\0b")]
+)
+def test_invalid_pax_names(tmp_path, key, value):
+    """N19, N22: a NUL inside a pax path, and an empty one, which POSIX says removes it."""
+    archive = (
+        extended(b"x", record(key, value)) + member("f", type=b"2", linkname="t") + EOF
+    )
+    rejects(archive, tmp_path, f"invalid pax {key}")
+
+
+@pytest.mark.parametrize("type", [b"L", b"K"])
+def test_gnu_long_names_with_nul_inside(tmp_path, type):
+    """Implementations that stop at the NUL and those that keep the rest see different
+    names."""
+    rejects(
+        extended(type, b"good\0bad\0") + member("f", type=b"2", linkname="t") + EOF,
+        tmp_path,
+        "NUL inside",
+    )
+
+
+def test_gnu_long_names_end_with_nuls():
+    archive = extended(b"L", b"name\0\0") + member("f", type=b"2", linkname="t") + EOF
+    assert members(archive) == [("name", "t", 0)]
+
+
+@pytest.mark.parametrize("type", [b"L", b"K"])
+def test_empty_gnu_long_names(tmp_path, type):
+    rejects(
+        extended(type, b"\0") + member("f", type=b"2", linkname="t") + EOF,
+        tmp_path,
+        "empty",
+    )
+
+
+@pytest.mark.parametrize("version", [b"00", b"\0\0", b" \0", b"  ", b"01"])
+def test_prefix_in_ustar_headers(version):
+    """F05, F11: implementations look at the magic "ustar\\0" and not at the version, which
+    some writers got wrong: a file in a dir would be extracted in the destination's top
+    level."""
+    archive = member("name", prefix="prefix", magic=b"ustar\0" + version) + EOF
+    assert members(archive) == [("prefix/name", "", 0)]
+
+
+@pytest.mark.parametrize("magic", [b"ustar  \0", b"ustar 00", b"ustarX00", bytes(8)])
+def test_prefix_in_other_headers(tmp_path, magic):
+    """N11: GNU incremental archives have times there, which some implementations take for a
+    prefix, as some do after any magic that starts with "ustar"."""
+    assert members(member("name", magic=magic) + EOF) == [("name", "", 0)]
+    rejects(member("name", prefix="prefix", magic=magic) + EOF, tmp_path, "not ustar")
+
+
+def test_star_prefix():
+    """N10: star's prefix is 131 bytes, followed by times: some implementations read only
+    those, others all 155."""
+    star = bytearray(header("name", prefix="p" * 131))
+    star[476:500] = b"14000000000\0" * 2
+    star[508:512] = b"tar\0"
+    with pytest.raises(untar.Error, match="star header"):
+        members(checksum(star) + EOF)
+    star[475] = 0
+    assert members(checksum(star) + EOF) == [("p" * 130 + "/name", "", 0)]
+
+
+@needs_symlinks
+def test_empty_symlink_target(tmp_path):
+    """N25: os.symlink("") fails with ENOENT, which is not "symlinks are not supported"."""
+    for archive in [
+        member("s", type=b"2") + EOF,
+        member("d/", type=b"5") + member("d/s", type=b"2") + EOF,
+    ]:
+        rejects(archive, tmp_path, "without a target")
+
+
+# Kinds (K): whether a member is a file, a directory or a link.
+
+
+@pytest.mark.parametrize(
+    "headers,name",
+    [
+        (extended(b"x", record("path", "file")), "dir/"),
+        (extended(b"L", b"file\0"), "dir/"),
+        (extended(b"x", record("path", "dir/")), "file"),
+    ],
+    ids=["pax path", "GNU long name", "pax dir"],
+)
+def test_old_dirs_named_like_dirs_once(tmp_path, headers, name):
+    """Old tar implementations write dirs as files named with a slash. Some implementations
+    look for it in the name in the header, others in the final name: a file there has data,
+    and a dir has none, which is where the others see a member."""
+    archive = headers + header(name, b"\0", 1024) + member("hidden", bytes(1024)) + EOF
+    rejects(archive, tmp_path, "named like a directory")
+
+
+def test_old_dirs_named_like_dirs():
+    archive = extended(b"x", record("path", "long/")) + header("dir/", b"\0", 0) + EOF
+    assert members(archive) == [("long", "", 0)]
+
+
+@pytest.mark.parametrize("name", ["file/", "dir/.", "dir/./"])
+def test_non_directories_named_like_directories(tmp_path, name):
+    """K01, K03: a regular file or a link named like a directory."""
+    rejects(member(name, b"x") + EOF, tmp_path, "named like a directory")
+
+
+# Order and state (S): members that interact, through one path or through links.
+
+
+@pytest.mark.parametrize(
+    "archive",
+    [
+        member("d/", type=b"5") + member("h", type=b"1", linkname="d") + EOF,
+        member("h", type=b"1", linkname="") + EOF,
+        member("h", type=b"1", linkname="h") + EOF,
+        member("h", type=b"1", linkname="missing") + EOF,
+    ],
+)
+def test_invalid_hardlinks(tmp_path, archive):
+    """S03, S13: hardlinks to a dir, to nothing, to themselves only, or to a member that
+    does not exist."""
+    rejects(archive, tmp_path, "hardlinks")
+
+
+def test_hardlink_to_itself(tmp_path):
+    """S04: tar cf a.tar f f archives f twice, the second time as a hardlink to itself."""
+    archive = member("f", b"x") + member("f", type=b"1", linkname="f") + EOF
+    untar.extract(io.BytesIO(archive), str(tmp_path))
+    assert (tmp_path / "f").read_bytes() == b"x"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="any symlink error means no privilege"
+)
+def test_copy_only_where_links_are_unsupported(tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(os, "symlink", fail)
+    with pytest.raises(OSError, match="I/O error"):
+        untar.extract(
+            io.BytesIO(member("t", b"x") + member("s", type=b"2", linkname="t") + EOF),
+            str(tmp_path),
+        )
+
+
+# Compression: outside of the tar layer that tar-minefield covers.
 
 
 def gzipped(size: int) -> bytes:
@@ -455,60 +639,7 @@ def test_gzip_invalid(tmp_path):
     rejects(bytes(archive), tmp_path, "gzip")
 
 
-# Links
-
-
-@needs_symlinks
-def test_empty_symlink_target(tmp_path):
-    """os.symlink("") fails with ENOENT, which is not "symlinks are not supported"."""
-    for archive in [
-        member("s", type=b"2") + EOF,
-        member("d/", type=b"5") + member("d/s", type=b"2") + EOF,
-    ]:
-        rejects(archive, tmp_path, "without a target")
-
-
-@pytest.mark.skipif(
-    sys.platform == "win32", reason="any symlink error means no privilege"
-)
-def test_copy_only_where_links_are_unsupported(tmp_path, monkeypatch):
-    def fail(*args, **kwargs):
-        raise OSError(errno.EIO, "I/O error")
-
-    monkeypatch.setattr(os, "symlink", fail)
-    with pytest.raises(OSError, match="I/O error"):
-        untar.extract(
-            io.BytesIO(member("t", b"x") + member("s", type=b"2", linkname="t") + EOF),
-            str(tmp_path),
-        )
-
-
-@pytest.mark.parametrize(
-    "archive",
-    [
-        member("d/", type=b"5") + member("h", type=b"1", linkname="d") + EOF,
-        member("h", type=b"1", linkname="") + EOF,
-        member("h", type=b"1", linkname="h") + EOF,
-        member("h", type=b"1", linkname="missing") + EOF,
-    ],
-)
-def test_invalid_hardlinks(tmp_path, archive):
-    rejects(archive, tmp_path, "hardlinks")
-
-
-def test_hardlink_to_itself(tmp_path):
-    """tar cf a.tar f f archives f twice, the second time as a hardlink to itself."""
-    archive = member("f", b"x") + member("f", type=b"1", linkname="f") + EOF
-    untar.extract(io.BytesIO(archive), str(tmp_path))
-    assert (tmp_path / "f").read_bytes() == b"x"
-
-
-@pytest.mark.parametrize("name", ["file/", "dir/.", "dir/./"])
-def test_non_directories_named_like_directories(tmp_path, name):
-    rejects(member(name, b"x") + EOF, tmp_path, "named like a directory")
-
-
-# The destination
+# The destination: what is already there, which no case of tar-minefield has.
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="symlinks")
@@ -522,10 +653,3 @@ def test_entries_in_the_destination_are_not_replaced(tmp_path):
         )
     assert sorted(os.listdir(dest)) == ["a"]
     assert (dest / "a").read_text() == "mine"
-
-
-def test_tarfile_reads_our_headers():
-    """The raw headers here are valid: tarfile agrees on the members of a simple archive."""
-    archive = member("a", b"x") + member("d/", type=b"5") + EOF
-    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-        assert [(m.name, m.size) for m in tar] == [("a", 1), ("d", 0)]

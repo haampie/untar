@@ -137,5 +137,10 @@ $ UNTAR_CPYTHON_TESTDATA=cpython-testdata pytest
 $ ruff check && ruff format --diff && mypy
 ```
 
+`tests/tar-minefield` is the test suite of [tar-minefield](https://github.com/haampie/tar-minefield),
+whose verdicts `tests/test_minefield.py` checks, and whose language the tests use: cases with
+an identifier such as `F12`, in the categories framing (F), names (N), kinds (K), and order and
+state (S), to reject, accept or tolerate.
+
 `tests/vendor/test_cpython.py` is adapted from CPython's `test_tarfile.py` and is under the PSF
 License Agreement included in it. The rest of untar is under the MIT license.
