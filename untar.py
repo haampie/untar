@@ -363,7 +363,8 @@ class TarReader:
                 if key in pax and (not pax[key] or "\0" in pax[key]):
                     raise Error(f"Archive contains an invalid pax {key} {pax[key]!r}")
 
-            header_name = _str(header[0:100])
+            raw_name, _, after_name = header[0:100].partition(b"\0")
+            header_name = raw_name.decode("utf-8", "surrogateescape")
             # Like GNU tar and libarchive, ustar headers have a name prefix, whatever their
             # version. Other headers have times there (GNU incremental), which some readers
             # take for a prefix.
@@ -384,11 +385,7 @@ class TarReader:
                 )
             name = long_name if long_name is not None else pax.get("path", header_name)
             # A name ends at its first NUL, but some readers keep what follows
-            if (
-                long_name is None
-                and "path" not in pax
-                and header[0:100].partition(b"\0")[2].strip(b"\0")
-            ):
+            if long_name is None and "path" not in pax and after_name.strip(b"\0"):
                 raise Error(f"Archive contains bytes after the NUL of the name {name}")
             # Readers create a name that is not UTF-8 as it is, or replace its bytes, also
             # where hdrcharset declares it
