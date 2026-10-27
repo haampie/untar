@@ -14,7 +14,7 @@ import os
 import stat
 import sys
 import zlib
-from typing import IO, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
+from typing import IO, Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 if sys.platform == "win32":
     import _winapi
@@ -624,6 +624,29 @@ class _Pinned(str):
     handle: int
 
 
+#: SetFileTime of kernel32, on Windows: loaded on first use, as importing ctypes takes ms
+_SetFileTime: Any = None
+
+
+def _set_mtime(fd: int, mtime: float) -> None:
+    """Set the access and modification times of an open file."""
+    if sys.platform != "win32":
+        os.utime(fd, (mtime, mtime))
+    else:
+        # os.utime takes no file descriptor on Windows, but SetFileTime takes its handle,
+        # with times in 100 ns since 1601
+        import ctypes
+
+        global _SetFileTime
+        if _SetFileTime is None:
+            _SetFileTime = ctypes.WinDLL("kernel32", use_last_error=True).SetFileTime
+            _SetFileTime.argtypes = (ctypes.c_void_p,) * 4
+        t = ctypes.c_uint64(int((mtime + 11644473600) * 10**7))
+        handle = msvcrt.get_osfhandle(fd)
+        if not _SetFileTime(handle, None, ctypes.byref(t), ctypes.byref(t)):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
 #: An open dir: a file descriptor, or a path where dir file descriptors are not supported,
 #: pinned on Windows
 Dir = Union[int, str]
@@ -750,10 +773,12 @@ class _Extractor:
         file_mode: int,
         dir_mode: int,
         gid: Optional[int],
+        mtime: Optional[float],
     ) -> None:
         self.file_mode = file_mode
         self.dir_mode = dir_mode
         self.gid = gid
+        self.mtime = mtime
         self.root: List[str] = []
         self.descending = True
         self.marker_name = root_marker
@@ -934,6 +959,8 @@ class _Extractor:
                 while view:
                     view = view[os.write(fd, view) :]
             self._attrs(fd, mode, self.chmod_files)
+            if self.mtime is not None:
+                _set_mtime(fd, self.mtime)
         finally:
             os.close(fd)
 
@@ -1140,6 +1167,7 @@ def extract(
     file_mode: int = 0o755,
     dir_mode: int = 0o755,
     gid: Optional[int] = None,
+    mtime: Optional[float] = None,
 ) -> str:
     """Extract the tar archive ``src``, a path or a binary file object that is read front to
     back once, into ``dest``: a path, which is created if it does not exist and may be a symlink
@@ -1154,7 +1182,9 @@ def extract(
 
     Files are created with ``file_mode``, without executable bits if the member is not
     executable by its owner, and dirs with ``dir_mode``, which must give the owner rwx; with
-    ``gid``, both get that group. Timestamps and ownership in the archive are not restored.
+    ``gid``, both get that group. With ``mtime``, in seconds since the epoch, all files get
+    that modification time, as autotools tarballs need. Timestamps and ownership in the
+    archive are not restored.
     Members must be regular files, dirs, symlinks or hardlinks, and cannot be absolute,
     contain ``..`` or be more than 1024 dirs deep. Where links cannot be created, their
     targets are copied."""
@@ -1165,7 +1195,7 @@ def extract(
     # Dir modes are set when dirs are created, and entries are then created in them
     if dir_mode & 0o700 != 0o700:
         raise ValueError(f"dir_mode {oct(dir_mode)} must give the owner rwx (0o700)")
-    extractor = _Extractor(dest, root_marker, file_mode, dir_mode, gid)
+    extractor = _Extractor(dest, root_marker, file_mode, dir_mode, gid, mtime)
     try:
         with _open_archive(src) as stream:
             reader = TarReader(stream)

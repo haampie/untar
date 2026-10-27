@@ -833,7 +833,32 @@ def test_reader():
     assert members == [("a", True, False), ("a/f", False, True), ("a/g", False, True)]
 
 
-# Modes and groups
+# Modes, groups and times
+
+#: An autotools package: configure is older than configure.ac by the archive's order
+AUTOTOOLS = [
+    ("configure", "f", b"#!/bin/sh\n", 0o755),
+    ("configure.ac", "f", b"AC_INIT\n", 0o644),
+    ("configure.copy", "h", "configure", 0o755),
+]
+
+
+@pytest.mark.parametrize("links", ["supported", "unsupported"])
+def test_mtime(tmp_path, monkeypatch, links, dir_fd):
+    """Every file gets mtime, hardlinks and their copies too, so that make does not take
+    generated files for older than their sources, whatever the order of the archive."""
+    if links == "unsupported":
+        monkeypatch.setattr(os, "link", fail_with_eperm)
+    mtime = 1_000_000_000
+    untar.extract(io.BytesIO(make_tar(AUTOTOOLS)), str(tmp_path), mtime=mtime)
+    for name, *_ in AUTOTOOLS:
+        assert os.stat(tmp_path / name).st_mtime == mtime
+
+
+def test_mtime_is_optional(tmp_path, monkeypatch):
+    """Without mtime, times are not set."""
+    monkeypatch.setattr(untar, "_set_mtime", None)
+    untar.extract(io.BytesIO(make_tar(AUTOTOOLS)), str(tmp_path))
 
 
 @pytest.fixture(params=[True, False], ids=["dir_fd", "path"])
