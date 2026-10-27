@@ -42,6 +42,13 @@ def make_tar(members, format=tarfile.PAX_FORMAT, compress=False) -> bytes:
     return gzip.compress(data) if compress else data
 
 
+def rejects(archive: bytes, tmp_path, match=None):
+    """Extracting the archive fails, and leaves the destination empty."""
+    with pytest.raises(untar.Error, match=match):
+        untar.extract(io.BytesIO(archive), str(tmp_path / "dest"))
+    assert os.listdir(tmp_path / "dest") == []
+
+
 def snapshot(root):
     """The tree below root: types, normalized modes, contents, link targets, hardlinks."""
     out = {}
@@ -605,10 +612,7 @@ def test_listed_twice_as_hardlinks(tmp_path, again):
     """S04: tar archives other entries listed twice as hardlinks to themselves, symlinks
     included, which implementations replace, empty, or leave alone."""
     name, _, _, mode = again
-    data = make_tar(LISTED_ONCE + [(name, "h", name, mode)])
-    with pytest.raises(untar.Error, match="to itself"):
-        untar.extract(io.BytesIO(data), str(tmp_path / "d"))
-    assert os.listdir(tmp_path / "d") == []
+    rejects(make_tar(LISTED_ONCE + [(name, "h", name, mode)]), tmp_path, "to itself")
 
 
 def is_gnu_tar() -> bool:
@@ -852,9 +856,7 @@ def test_symlinks_that_cannot_be_copied(tmp_path, monkeypatch, target):
     it."""
     monkeypatch.setattr(os, "symlink", fail_with_eperm)
     members = [("f", "f", b"x", 0o644), ("s", "s", target, 0o777)]
-    with pytest.raises(untar.Error, match="symlink s to"):
-        untar.extract(io.BytesIO(make_tar(members)), str(tmp_path / "d"))
-    assert os.listdir(tmp_path / "d") == []
+    rejects(make_tar(members), tmp_path, "symlink s to")
 
 
 @pytest.mark.parametrize(
@@ -867,9 +869,7 @@ def test_no_entries_at_or_below_copied_symlinks(tmp_path, monkeypatch, entry, ta
     copy, whether it is copied right away or after the last member."""
     monkeypatch.setattr(os, "symlink", fail_with_eperm)
     members = [("dir", "d", None, 0o755), ("s", "s", target, 0o777), entry]
-    with pytest.raises(untar.Error, match="at or below the symlink s"):
-        untar.extract(io.BytesIO(make_tar(members)), str(tmp_path / "d"))
-    assert os.listdir(tmp_path / "d") == []
+    rejects(make_tar(members), tmp_path, "at or below the symlink s")
 
 
 @pytest.mark.parametrize("target_first", [False, True])
@@ -879,8 +879,7 @@ def test_no_hardlinks_to_copied_symlinks(tmp_path, monkeypatch, target_first):
     target = [("f", "f", b"x", 0o644)]
     members = [("s", "s", "f", 0o777), ("h", "h", "s", 0o644)]
     members = target + members if target_first else members[:1] + target + members[1:]
-    with pytest.raises(untar.Error, match="which is a symlink"):
-        untar.extract(io.BytesIO(make_tar(members)), str(tmp_path / "d"))
+    rejects(make_tar(members), tmp_path, "which is a symlink")
 
 
 def test_symlink_chains_are_copied_where_unsupported(tmp_path, monkeypatch):

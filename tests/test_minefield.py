@@ -15,7 +15,7 @@ import posixpath
 import stat
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
 import pytest
 from test_untar import fail_with_eperm
@@ -34,12 +34,6 @@ REJECTED = {
     "F14": "the size field has room for the pax size, but gives another",
 }
 
-#: Cases where untar does not do as the verdict says, by identifier: to fix in untar
-DISAGREES: Dict[str, str] = {}
-
-#: The same, only where links are not supported and untar copies their targets
-DISAGREES_WITHOUT_LINKS: Dict[str, str] = {}
-
 
 def manifest(case: str) -> dict:
     with open(SUITE / f"{case}.json", encoding="utf-8") as f:
@@ -47,19 +41,17 @@ def manifest(case: str) -> dict:
 
 
 def entry(path: Path) -> dict:
-    """The entry of one path, as in the manifests."""
+    """The entry of one path, as in the manifests, without executable bits on Windows."""
     st = os.lstat(path)
     if stat.S_ISLNK(st.st_mode):
         return {"kind": "symlink", "target": os.readlink(path)}
     if stat.S_ISDIR(st.st_mode):
         return {"kind": "directory"}
     data = path.read_bytes()
-    return {
-        "kind": "file",
-        "size": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
-        "executable": bool(st.st_mode & stat.S_IXUSR),
-    }
+    e = {"kind": "file", "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    if sys.platform != "win32":
+        e["executable"] = bool(st.st_mode & stat.S_IXUSR)
+    return e
 
 
 def tree(top: Path) -> dict:
@@ -85,39 +77,18 @@ def expected_tree(info: dict, links: bool) -> Optional[dict]:
         return expected
     copies = {}
     for path, e in expected.items():
-        target, seen = path, set()
-        while e["kind"] == "symlink":
-            target = posixpath.normpath(
-                posixpath.join(posixpath.dirname(target), e["target"])
-            )
-            if target in seen or target not in expected:
+        if e["kind"] == "symlink":
+            target = posixpath.join(posixpath.dirname(path), e["target"])
+            # No case has a symlink to a symlink or to a dir, whose copies differ
+            e = expected.get(posixpath.normpath(target), {})
+            if e.get("kind") != "file":
                 return None
-            seen.add(target)
-            e = expected[target]
-            # The copy of a dir is its subtree: no case has a symlink to one yet
-            assert e["kind"] != "directory"
         copies[path] = e
     return copies
 
 
-def same(actual: dict, expected: dict) -> bool:
-    """Whether a tree is the expected one, comparing what the manifest says of each entry."""
-    return actual.keys() == expected.keys() and all(
-        actual[path].get(k) == v for path, e in expected.items() for k, v in e.items()
-    )
-
-
-def params():
-    for case in CASES:
-        for links in ("supported", "unsupported"):
-            reason = DISAGREES.get(case[:3])
-            if links == "unsupported":
-                reason = reason or DISAGREES_WITHOUT_LINKS.get(case[:3])
-            marks = [pytest.mark.xfail(reason=reason, strict=True)] if reason else []
-            yield pytest.param(case, links, marks=marks, id=f"{case}-{links}")
-
-
-@pytest.mark.parametrize("case,links", list(params()))
+@pytest.mark.parametrize("links", ["supported", "unsupported"])
+@pytest.mark.parametrize("case", CASES)
 def test_case(tmp_path, monkeypatch, case, links):
     info = manifest(case)
     if links == "unsupported":
@@ -148,7 +119,7 @@ def test_case(tmp_path, monkeypatch, case, links):
         assert error is not None, f"accepts a case to reject, as {tree(dest)}"
         return
     expected = expected_tree(info, links == "supported")
-    if expected is None or info["verdict"] == "tolerate" and info["id"] in REJECTED:
+    if expected is None or info["id"] in REJECTED:
         assert error is not None, f"accepts it, as {tree(dest)}"
         return
     if error is not None:
@@ -157,15 +128,12 @@ def test_case(tmp_path, monkeypatch, case, links):
         if sys.platform == "win32" and not isinstance(error, untar.Error):
             return
         raise error
-    actual = tree(dest)
-    assert same(actual, expected), f"extracts {actual}, not {expected}"
+    assert tree(dest) == expected
 
 
-def test_lists_name_cases():
-    """Every case has a manifest, and the lists above name cases by their identifiers."""
+def test_rejected_are_tolerated():
+    """Every case has a manifest, and REJECTED names tolerated cases."""
     infos = [manifest(case) for case in CASES]
     assert infos and len(infos) == len(list(SUITE.glob("*.json")))
-    ids = {info["id"] for info in infos}
-    assert DISAGREES.keys() <= ids and DISAGREES_WITHOUT_LINKS.keys() <= ids
     tolerated = {info["id"] for info in infos if info["verdict"] == "tolerate"}
     assert REJECTED.keys() <= tolerated
