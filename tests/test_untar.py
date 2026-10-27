@@ -363,6 +363,37 @@ def test_no_files_over_symlinks_to_nothing(tmp_path):
     assert sorted(os.listdir(tmp_path)) == ["link"]
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="dirs are pinned on Windows")
+def test_pinned_dirs_cannot_be_swapped(tmp_path):
+    """Windows has no dir file descriptors: dirs are held open without sharing delete
+    access, so that neither they nor their parents can be renamed or removed, and nothing on
+    the path to an entry can be swapped for a junction or symlink."""
+    (tmp_path / "parent" / "dir").mkdir(parents=True)
+    d = untar._open_dir(str(tmp_path / "parent"), "dir")
+    try:
+        for path in [tmp_path / "parent" / "dir", tmp_path / "parent"]:
+            with pytest.raises(PermissionError):
+                os.rename(path, tmp_path / "moved")
+        with pytest.raises(PermissionError):
+            os.rmdir(tmp_path / "parent" / "dir")
+        # Entries are created in it as usual
+        (tmp_path / "parent" / "dir" / "f").write_text("x")
+    finally:
+        untar._close(d)
+    os.rename(tmp_path / "parent", tmp_path / "moved")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="junctions are of Windows")
+def test_no_entries_through_junctions(tmp_path):
+    """A junction is a dir to lstat, but leads elsewhere, like a symlink."""
+    import _winapi
+
+    (tmp_path / "target").mkdir()
+    _winapi.CreateJunction(str(tmp_path / "target"), str(tmp_path / "junction"))
+    with pytest.raises(untar.Error, match="not a directory"):
+        untar._open_dir(str(tmp_path), "junction")
+
+
 @needs_symlinks
 def test_symlink_in_dest(tmp_path):
     """A symlink already in dest is not followed by members of that name."""

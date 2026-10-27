@@ -21,9 +21,12 @@ if sys.platform == "win32":
     import msvcrt
 
     # Arguments of CreateFile, which _winapi does not all have
+    _GENERIC_READ = 0x80000000
     _GENERIC_WRITE = 0x40000000
     _FILE_SHARE_READ_WRITE = 0x1 | 0x2
     _CREATE_NEW = 1
+    _OPEN_EXISTING = 3
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
     _FILE_ATTRIBUTE_READONLY = 0x1
     _FILE_ATTRIBUTE_NORMAL = 0x80
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
@@ -613,7 +616,16 @@ def _create(path: str, dir_fd: Optional[int], mode: int) -> int:
     return os.open(path, _FILE_FLAGS, mode, dir_fd=dir_fd)
 
 
-#: An open dir: a file descriptor, or a path where dir file descriptors are not supported
+class _Pinned(str):
+    """The path of a dir, with a handle that does not share delete access, so that the dir
+    cannot be renamed or removed while it is open: on Windows, which has no dir file
+    descriptors, nothing on a path of such dirs can be swapped for a symlink or junction."""
+
+    handle: int
+
+
+#: An open dir: a file descriptor, or a path where dir file descriptors are not supported,
+#: pinned on Windows
 Dir = Union[int, str]
 
 
@@ -636,9 +648,29 @@ def _open_dir(parent: Dir, name: str) -> Dir:
                 ) from e
             raise
     path = os.path.join(parent, name)
-    if not stat.S_ISDIR(os.lstat(path).st_mode):
-        raise Error(f"Archive writes through {name}, which is not a directory")
-    return path
+    d = path
+    if sys.platform == "win32":
+        d = _Pinned(path)
+        d.handle = _winapi.CreateFile(
+            path,
+            _GENERIC_READ,
+            _FILE_SHARE_READ_WRITE,
+            0,
+            _OPEN_EXISTING,
+            _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+            0,
+        )
+    # Once pinned, what is at path stays: a junction is a dir to lstat, but a reparse point
+    try:
+        s = os.lstat(path)
+        if not stat.S_ISDIR(s.st_mode) or getattr(s, "st_file_attributes", 0) & (
+            stat.FILE_ATTRIBUTE_REPARSE_POINT
+        ):
+            raise Error(f"Archive writes through {name}, which is not a directory")
+    except BaseException:
+        _close(d)
+        raise
+    return d
 
 
 def _lstat(parent: Dir, name: str) -> Optional[os.stat_result]:
@@ -653,6 +685,8 @@ def _lstat(parent: Dir, name: str) -> Optional[os.stat_result]:
 def _close(d: Dir) -> None:
     if isinstance(d, int):
         os.close(d)
+    elif sys.platform == "win32" and isinstance(d, _Pinned):
+        _winapi.CloseHandle(d.handle)
 
 
 def _rmdir(parent: Dir, name: str) -> bool:
@@ -782,11 +816,12 @@ class _Extractor:
                 break
         for d in self.dirs:
             _close(d)
-        if not _rmdir(self.dest, self.tmp_name):
-            with contextlib.suppress(OSError):
+        # A pinned dir cannot be removed: tmp is emptied, and closed before it is removed
+        with contextlib.suppress(OSError):
+            if os.listdir(self.tmp):
                 self._remove_tmp()
-            _rmdir(self.dest, self.tmp_name)
         _close(self.tmp)
+        _rmdir(self.dest, self.tmp_name)
         _close(self.dest)
 
     def _remove_tmp(self) -> None:
@@ -859,10 +894,11 @@ class _Extractor:
         return d
 
     def _push(self, name: str, d: Dir) -> None:
-        """Put an open dir on the stack, and close the one that is no longer among the deepest."""
+        """Put an open dir on the stack, and close the one that is no longer among the deepest.
+        By path, every dir on the stack stays open, so that none on the path can be swapped."""
         self.names.append(name)
         self.dirs.append(d)
-        if len(self.dirs) > _MAX_OPEN_DIRS:
+        if _DIR_FD and len(self.dirs) > _MAX_OPEN_DIRS:
             _close(self.dirs.pop(0))
 
     def _open_ancestor(self, n: int) -> Tuple[int, Dir]:
@@ -977,19 +1013,23 @@ class _Extractor:
                 f"Archive contains {member.name} of unsupported type {member.type!r}"
             )
 
-    def _open_existing(self, parts: List[str]) -> Tuple[Dir, bool]:
+    def _open_existing(self, parts: List[str]) -> Tuple[Dir, List[Dir]]:
         """Open tmp/parts without creating anything, from the deepest dir on the stack that
-        contains it. Returns the dir and whether it was opened here, and must be closed."""
+        contains it. Returns the dir and the dirs opened here, which must be closed: by path,
+        all of them stay open, so that none on the path can be swapped."""
         common, d = self._open_ancestor(_common(self.names, parts))
-        owned = False
-        for name in parts[common:]:
-            try:
-                child = _open_dir(d, name)
-            finally:
-                if owned:
-                    _close(d)
-            d, owned = child, True
-        return d, owned
+        opened: List[Dir] = []
+        try:
+            for name in parts[common:]:
+                d = _open_dir(d, name)
+                if _DIR_FD and opened:
+                    _close(opened.pop())
+                opened.append(d)
+        except BaseException:
+            for o in opened:
+                _close(o)
+            raise
+        return d, opened
 
     def _copy(self, source: List[str], dest: List[str], link: bool = False) -> bool:
         """Hardlink or copy an extracted entry to dest, and return whether it was extracted."""
@@ -1001,7 +1041,7 @@ class _Extractor:
         # Open dest's parent first, since that may close dirs on the stack that source reuses.
         parent = self._dir(dest[:-1])
         try:
-            source_parent, owned = self._open_existing(source[:-1])
+            source_parent, opened = self._open_existing(source[:-1])
         except (FileNotFoundError, Error):
             return False
         try:
@@ -1044,8 +1084,8 @@ class _Extractor:
                 os.close(src)
             return True
         finally:
-            if owned:
-                _close(source_parent)
+            for d in opened:
+                _close(d)
 
     def finish(self) -> str:
         """Move the contents of the final root into dest, and return its archive name."""
