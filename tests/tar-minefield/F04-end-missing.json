@@ -1,0 +1,8 @@
+{
+ "id": "F04",
+ "verdict": "reject",
+ "description": "No end-of-archive marker: the archive ends after a complete member.",
+ "features": [
+  "end.missing"
+ ]
+}
