@@ -35,9 +35,7 @@ REJECTED = {
 }
 
 #: Cases where untar does not do as the verdict says, by identifier: to fix in untar
-DISAGREES = {
-    "S04": "accepts a hardlink to itself, as tar cf a.tar f f writes",
-}
+DISAGREES: Dict[str, str] = {}
 
 #: The same, only where links are not supported and untar copies their targets
 DISAGREES_WITHOUT_LINKS: Dict[str, str] = {}
