@@ -123,8 +123,10 @@ checks are path based and not safe against concurrent changes.
 
 Parsing is relatively strict: the idea is to reject tar files that would extract differently
 under tar implementations with more lenient parsing. Numbers must be plain digits, a member's name
-and size come from one header only, global pax headers cannot set them, long names cannot have a
-NUL inside, and links, dirs, devices and fifos cannot have a size. The gzip checksum is always
+and size come from one header only, global pax headers cannot set them, names must be UTF-8
+without a NUL or backslash inside, only links have a link target, and links, dirs, devices and
+fifos cannot have a size. The rules are those of the default policy of
+[tar-minefield](https://github.com/haampie/tar-minefield). The gzip checksum is always
 verified, and an archive must end with two zero blocks and only zeros after them, so that neither
 truncation between members nor a second archive after the first goes unnoticed.
 

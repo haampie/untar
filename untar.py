@@ -383,6 +383,26 @@ class TarReader:
                     "Archive contains a name prefix in a header that is not ustar"
                 )
             name = long_name if long_name is not None else pax.get("path", header_name)
+            # A name ends at its first NUL, but some readers keep what follows
+            if (
+                long_name is None
+                and "path" not in pax
+                and header[0:100].partition(b"\0")[2].strip(b"\0")
+            ):
+                raise Error(f"Archive contains bytes after the NUL of the name {name}")
+            # Readers create a name that is not UTF-8 as it is, or replace its bytes, also
+            # where hdrcharset declares it
+            if "hdrcharset" in pax:
+                raise Error(f"Archive contains the pax hdrcharset {pax['hdrcharset']}")
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                raise Error(
+                    f"Archive contains a name that is not UTF-8 {name!r}"
+                ) from None
+            # A separator on Windows, and a character elsewhere
+            if "\\" in name:
+                raise Error(f"Archive contains a backslash in the name {name}")
             if type == AREGTYPE:
                 # Old tar implementations write dirs as files named with a slash. tarfile
                 # looks for it in the name in the header, others in the final name.
@@ -410,6 +430,11 @@ class TarReader:
                 size = pax_size
             if long_link is None:
                 long_link = pax.get("linkpath", _str(header[157:257]))
+            # Readers that look at the link target rather than the type make a link of it
+            if long_link and type != LNKTYPE and type != SYMTYPE:
+                raise Error(
+                    f"Archive contains {name} of type {type!r} with a link target"
+                )
             member = Member(name, type, _int(header[100:108]), size, long_link)
 
             if type not in _NO_DATA_TYPES:

@@ -314,13 +314,16 @@ def test_size_without_data(type, pax):
     as headers, and skip the size of a dir; the Rust tar crates skip it as data, and some
     implementations take the size of a dir for data: either could miss a member."""
     hidden = member("hidden", b"x")
+    linkname = "t" if type in b"12" else ""
     if pax:
         # Too large for the ustar size, which is 0 then
         size = untar._PAX_SIZE
-        archive = extended(b"x", record("size", str(size))) + header("f", type, 0, "t")
+        archive = extended(b"x", record("size", str(size))) + header(
+            "f", type, 0, linkname
+        )
     else:
         size = 512
-        archive = header("f", type, size, "t")
+        archive = header("f", type, size, linkname)
     with pytest.raises(untar.Error, match=f"with size {size}"):
         members(archive + hidden + EOF)
 
@@ -585,6 +588,35 @@ def test_star_prefix():
     assert members(checksum(star) + EOF) == [("p" * 130 + "/name", "", 0)]
 
 
+def test_bytes_after_nul_in_names(tmp_path):
+    """N14: a name ends at its first NUL, but some implementations keep what follows."""
+    rejects(member("a\0b") + EOF, tmp_path, "after the NUL")
+    # Unless a pax path or a GNU long name gives the name
+    for headers in [extended(b"x", record("path", "long")), extended(b"L", b"long\0")]:
+        assert members(headers + member("a\0b") + EOF) == [("long", "", 0)]
+
+
+def test_names_that_are_not_utf8(tmp_path):
+    """N18, N24: implementations create such a name as it is, or replace its bytes, also
+    where the pax hdrcharset declares it."""
+    h = bytearray(header("cafe"))
+    h[3] = 0xE9
+    for headers in [
+        b"",
+        extended(b"x", record("path", b"caf\xe9")),
+        extended(b"L", b"caf\xe9\0"),
+    ]:
+        rejects(headers + checksum(h) + EOF, tmp_path, "not UTF-8")
+    hdrcharset = record("hdrcharset", "BINARY") + record("path", "cafe")
+    rejects(extended(b"x", hdrcharset) + member() + EOF, tmp_path, "hdrcharset")
+
+
+@pytest.mark.parametrize("name", ["a\\b", "..\\a"])
+def test_backslashes_in_names(tmp_path, name):
+    """N13: a separator on Windows, and a character elsewhere."""
+    rejects(member(name) + EOF, tmp_path, "backslash")
+
+
 @needs_symlinks
 def test_empty_symlink_target(tmp_path):
     """N25: os.symlink("") fails with ENOENT, which is not "symlinks are not supported"."""
@@ -618,6 +650,22 @@ def test_old_dirs_named_like_dirs_once(tmp_path, headers, name):
 def test_old_dirs_named_like_dirs():
     archive = extended(b"x", record("path", "long/")) + header("dir/", b"\0", 0) + EOF
     assert members(archive) == [("long", "", 0)]
+
+
+@pytest.mark.parametrize(
+    "archive",
+    [
+        member("f", b"x", linkname="t"),
+        member("d/", type=b"5", linkname="t"),
+        extended(b"x", record("linkpath", "t")) + member("f", b"x"),
+        extended(b"K", b"t\0") + member("f", b"x"),
+    ],
+    ids=["file", "dir", "pax linkpath", "GNU long link"],
+)
+def test_link_targets_of_other_kinds(tmp_path, archive):
+    """K02: implementations that look at the link target rather than the type make a link
+    of the member."""
+    rejects(archive + EOF, tmp_path, "with a link target")
 
 
 @pytest.mark.parametrize("name", ["file/", "dir/.", "dir/./"])
