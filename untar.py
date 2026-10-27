@@ -12,7 +12,6 @@ import errno
 import gzip
 import os
 import stat
-import struct
 import sys
 import zlib
 from typing import IO, Dict, Iterable, Iterator, List, Optional, Tuple, Union
@@ -53,8 +52,14 @@ _BUF = 1024 * 1024
 _SPARSE_KEYS = ("SCHILY.realsize", "SUN.holesdata")
 #: Pax and GNU long name headers are read into memory: limit their size per member
 _MAX_EXTENDED = 1024 * 1024
-#: Digits of a pax number: enough for any size, with zero padding
+#: Digits of a pax number: enough for any size
 _MAX_DIGITS = 32
+#: The magics of headers: POSIX, with its version 00 or NULs as some Java archivers write it,
+#: GNU, and none (v7)
+_POSIX_MAGICS = (b"ustar\x0000", b"ustar\0\0\0")
+_OTHER_MAGICS = (b"ustar  \0", bytes(8))
+#: Pax keys that may have newlines in their values: xattrs, which are not extracted
+_XATTR_KEYS = (b"SCHILY.xattr.", b"LIBARCHIVE.xattr.")
 #: Dirs on the stack that stay open: the deepest ones, and shallower ones are reopened if needed
 _MAX_OPEN_DIRS = 64
 #: Path components per member: on macOS, creating an entry takes time linear in its depth
@@ -131,9 +136,16 @@ def _long_name(data: bytes) -> str:
 
 
 def _decimal(value: str, key: str) -> int:
-    """A pax decimal number, of ASCII digits only."""
-    # int() of thousands of digits is slow, and fails from Python 3.11 on
-    if not value or value.strip("0123456789") or len(value) > _MAX_DIGITS:
+    """A pax decimal number, of ASCII digits only, without leading zeros."""
+    # int() of thousands of digits is slow, and fails from Python 3.11 on. Some readers take
+    # a leading zero for octal.
+    if (
+        not value
+        or value.strip("0123456789")
+        or len(value) > _MAX_DIGITS
+        or len(value) > 1
+        and value[0] == "0"
+    ):
         raise Error(f"Archive contains an invalid pax {key} {value[:_MAX_DIGITS]!r}")
     return int(value)
 
@@ -146,11 +158,9 @@ def _checksum_ok(header: bytes) -> bool:
     total = (zlib.adler32(header[:256], 0) & 0xFFFF) + (
         zlib.adler32(header[256:], 0) & 0xFFFF
     )
-    if expected == total - sum(header[148:156]) + 256:
-        return True
-    # Some old tar implementations summed signed chars
-    signed = struct.unpack("148b8x356b", header)
-    return expected == sum(signed) + 256
+    # Not the signed sum, which some old tar implementations wrote: others refuse it, and some
+    # look for the next header in what follows
+    return expected == total - sum(header[148:156]) + 256
 
 
 def _pax_records(data: bytes) -> Dict[str, str]:
@@ -173,9 +183,14 @@ def _pax_records(data: bytes) -> Dict[str, str]:
         # GNU tar skips blanks before a key, and readers stop at a NUL in it or skip it
         if not key or not equals or key[0] in b" \t" or 0 in key:
             raise Error("Archive contains an invalid pax record")
-        records[key.decode("utf-8", "surrogateescape")] = value.decode(
-            "utf-8", "surrogateescape"
-        )
+        name = key.decode("utf-8", "surrogateescape")
+        # Records are delimited by their length, but some readers split them on newlines
+        if 0x0A in value and not key.startswith(_XATTR_KEYS):
+            raise Error(f"Archive contains a newline in the pax {name}")
+        # Readers take the first or the last of them
+        if name in records:
+            raise Error(f"Archive contains the pax {name} twice in one header")
+        records[name] = value.decode("utf-8", "surrogateescape")
         pos = end
     return records
 
@@ -316,6 +331,12 @@ class TarReader:
                 data = self._read(size)
                 self._read(-size % _BLOCK)
                 if type == _PAX_GLOBAL_HEADER:
+                    # An extended header before it applies to it for some readers, and to
+                    # the member for others
+                    if seen:
+                        raise Error(
+                            "Archive contains a global pax header after an extended header"
+                        )
                     # Readers disagree on whether these apply to later members: refuse them.
                     if {"path", "linkpath", "size"} & _pax_records(data).keys():
                         raise Error(
@@ -332,10 +353,12 @@ class TarReader:
                     long_name = _long_name(data)
                 else:
                     long_link = _long_name(data)
-            if long_name is not None and "path" in pax:
-                raise Error("Archive contains both a pax path and a GNU long name")
-            if long_link is not None and "linkpath" in pax:
-                raise Error("Archive contains both a pax linkpath and a GNU long link")
+            # Each extends the next header, and does not know the other: a GNU long name before
+            # a pax header can apply to the pax header, and a pax size to a GNU long name.
+            if _PAX_HEADER in seen and (_GNU_LONGNAME in seen or _GNU_LONGLINK in seen):
+                raise Error(
+                    "Archive contains both a pax header and a GNU long name for one member"
+                )
             for key in ("path", "linkpath"):
                 if key in pax and (not pax[key] or "\0" in pax[key]):
                     raise Error(f"Archive contains an invalid pax {key} {pax[key]!r}")
@@ -344,13 +367,17 @@ class TarReader:
             # Like GNU tar and libarchive, ustar headers have a name prefix, whatever their
             # version. Other headers have times there (GNU incremental), which some readers
             # take for a prefix.
-            if header[257:263] == b"ustar\0":
+            magic = header[257:265]
+            if magic in _POSIX_MAGICS:
                 # star's prefix is 131 bytes, followed by times, for some readers
                 if header[508:512] == b"tar\0" and 0 not in header[345:476]:
                     raise Error("Archive contains a star header with a long prefix")
                 prefix = _str(header[345:500])
                 if prefix:
                     header_name = f"{prefix}/{header_name}"
+            elif magic not in _OTHER_MAGICS:
+                # A damaged magic, or a version that readers take for ustar or not
+                raise Error(f"Archive contains a header with the magic {magic!r}")
             elif header[345]:
                 raise Error(
                     "Archive contains a name prefix in a header that is not ustar"
@@ -387,9 +414,9 @@ class TarReader:
 
             if type not in _NO_DATA_TYPES:
                 self.remaining = member.size
-            elif member.size and type != DIRTYPE:
-                # Readers disagree on whether data follows. Some tar implementations give dirs
-                # a size, which tar and tarfile ignore, so only those are read like tar.
+            elif member.size:
+                # Readers disagree on whether data follows: tar and tarfile skip the size of a
+                # dir, and take that of other types for data.
                 raise Error(
                     f"Archive contains {name} of type {type!r} with size {member.size}"
                 )

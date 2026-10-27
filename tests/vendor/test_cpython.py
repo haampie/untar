@@ -133,13 +133,25 @@ def raw_members(data: bytes):
         yield member, data[member.offset : end]
 
 
-def supported(member: tarfile.TarInfo) -> bool:
-    # pax/regtype4 has a pax size, and 0 as the size in its header, which readers that
-    # ignore the pax size read
+def unsigned_checksum(header: bytes) -> bool:
+    """Whether the checksum of a header is the sum of its bytes, as POSIX says."""
+    expected = int(header[148:156].strip(b" \0"), 8)
+    return expected == sum(header[:148]) + sum(header[156:]) + 256
+
+
+def supported(member: tarfile.TarInfo, raw: bytes) -> bool:
+    """Whether untar extracts a member, which it does not if tar-minefield rejects it. pax/regtype4
+    has a pax size, and 0 as the size in its header, which readers that ignore the pax size read
+    (F14). ustar/dirtype-with-size is a dir with a size, which readers skip or take for data
+    (F33). The checksums of misc/regtype-*-signed-chksum-* only match as the sum of signed
+    bytes, which some readers refuse (F06)."""
+    header = raw[member.offset_data - member.offset - 512 :][:512]
     return (
         member.type not in UNSUPPORTED
         and not member.issparse()
         and "size" not in member.pax_headers
+        and not (member.isdir() and member.size)
+        and unsigned_checksum(header)
     )
 
 
@@ -157,7 +169,7 @@ def without_unsupported(data: bytes, extractable: bool = False) -> bytes:
     kept = b"".join(
         raw
         for member, raw in raw_members(data)
-        if supported(member)
+        if supported(member, raw)
         and (not extractable or sys.platform != "darwin" or utf8(member))
     )
     return kept + bytes(1024)
@@ -201,14 +213,14 @@ def test_members_like_tarfile():
                 content,
             )
         )
-    assert len(actual) == len(expected) == 30
+    assert len(actual) == len(expected) == 27
     for a, e in zip(actual, expected):
         assert a == e, e[0]
 
 
 @needs_testdata
 def test_checksums():
-    """MemberReadTest: the data of regular files, including old v7 and signed checksums."""
+    """MemberReadTest: the data of regular files, including old v7."""
     reader = untar.TarReader(io.BytesIO(without_unsupported(read_testtar())))
     sums = {}
     for m in reader:
@@ -218,8 +230,6 @@ def test_checksums():
         "ustar/regtype",
         "ustar/umlauts-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
         "misc/regtype-old-v7",
-        "misc/regtype-hpux-signed-chksum-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
-        "misc/regtype-old-v7-signed-chksum-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
         "misc/regtype-suntar",
         "misc/regtype-xstar",
         "pax/umlauts-\xc4\xd6\xdc\xe4\xf6\xfc\xdf",
@@ -234,11 +244,11 @@ def test_checksums():
 
 @needs_testdata
 def test_unsupported_members():
-    """Sparse files of each kind, devices, fifos, contiguous files and a pax size that the size in
-    the header disagrees with are rejected, each in an archive of its own."""
+    """Sparse files of each kind, devices, fifos, contiguous files, and what tar-minefield
+    rejects, are rejected, each in an archive of its own."""
     rejected = []
     for member, raw in raw_members(read_testtar()):
-        if supported(member):
+        if supported(member, raw):
             continue
         with pytest.raises(untar.Error):
             for m in untar.TarReader(io.BytesIO(raw + bytes(1024))):
@@ -247,6 +257,7 @@ def test_unsupported_members():
         rejected.append(member.name)
     assert rejected == [
         "ustar/conttype",
+        "ustar/dirtype-with-size",
         "ustar/blktype",
         "ustar/chrtype",
         "ustar/fifotype",
@@ -254,6 +265,8 @@ def test_unsupported_members():
         "gnu/sparse-0.0",
         "gnu/sparse-0.1",
         "gnu/sparse-1.0",
+        "misc/regtype-hpux-signed-chksum-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
+        "misc/regtype-old-v7-signed-chksum-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
         "pax/regtype4",
     ]
 
