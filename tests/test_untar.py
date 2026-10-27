@@ -366,21 +366,22 @@ def test_no_files_over_symlinks_to_nothing(tmp_path):
 @pytest.mark.skipif(sys.platform != "win32", reason="dirs are pinned on Windows")
 def test_pinned_dirs_cannot_be_swapped(tmp_path):
     """Windows has no dir file descriptors: dirs are held open without sharing delete
-    access, so that neither they nor their parents can be renamed or removed, and nothing on
-    the path to an entry can be swapped for a junction or symlink."""
-    (tmp_path / "parent" / "dir").mkdir(parents=True)
-    d = untar._open_dir(str(tmp_path / "parent"), "dir")
+    access, so that neither they nor their ancestors can be renamed or removed, and nothing
+    on the path to an entry can be swapped for a junction or symlink."""
+    parent = tmp_path / "grandparent" / "parent"
+    (parent / "dir").mkdir(parents=True)
+    d = untar._open_dir(str(parent), "dir")
     try:
-        for path in [tmp_path / "parent" / "dir", tmp_path / "parent"]:
+        for path in [parent / "dir", parent, parent.parent]:
             with pytest.raises(PermissionError):
                 os.rename(path, tmp_path / "moved")
         with pytest.raises(PermissionError):
-            os.rmdir(tmp_path / "parent" / "dir")
+            os.rmdir(parent / "dir")
         # Entries are created in it as usual
-        (tmp_path / "parent" / "dir" / "f").write_text("x")
+        (parent / "dir" / "f").write_text("x")
     finally:
         untar._close(d)
-    os.rename(tmp_path / "parent", tmp_path / "moved")
+    os.rename(parent.parent, tmp_path / "moved")
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="junctions are of Windows")
