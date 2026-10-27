@@ -37,7 +37,6 @@ REJECTED = {
 #: Cases where untar does not do as the verdict says, by identifier: to fix in untar
 DISAGREES = {
     "S04": "accepts a hardlink to itself, as tar cf a.tar f f writes",
-    "S06": "accepts a hardlink to a symlink",
 }
 
 #: The same, only where links are not supported and untar copies their targets

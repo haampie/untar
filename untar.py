@@ -913,7 +913,10 @@ class _Extractor:
             if self.chown:
                 os.chown(path, -1, self.gid, dir_fd=dir_fd, follow_symlinks=False)  # type: ignore
         elif member.islnk():
-            if not self._copy(_parts(member.linkname), parts, link=True):
+            source = _parts(member.linkname)
+            if tuple(source) in self.copies:
+                raise Error(f"Archive hardlinks {member.linkname}, which is a symlink")
+            if not self._copy(source, parts, link=True):
                 raise Error(
                     f"Archive hardlinks {member.linkname}, which is not extracted"
                 )
@@ -953,6 +956,9 @@ class _Extractor:
             if source == dest:
                 # tar archives an entry listed twice as a hardlink to itself
                 return not stat.S_ISDIR(s.st_mode)
+            if link and stat.S_ISLNK(s.st_mode):
+                # A link to the symlink, or to its target: link() may follow it
+                raise Error(f"Archive hardlinks {'/'.join(source)}, which is a symlink")
             path, dir_fd = _at(source_parent, source[-1])
             if stat.S_ISDIR(s.st_mode):
                 if link:
