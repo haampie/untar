@@ -848,6 +848,9 @@ class _Extractor:
         chunks: Iterable[Union[bytes, memoryview]],
     ) -> None:
         path, dir_fd = _at(parent, name)
+        # Without O_NOFOLLOW, as on Windows, O_EXCL creates the target of a symlink to nothing
+        if not _O_NOFOLLOW and _lstat(parent, name) is not None:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), path)
         fd = os.open(path, _FILE_FLAGS, mode, dir_fd=dir_fd)
         try:
             for data in chunks:
