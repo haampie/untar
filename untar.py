@@ -31,7 +31,7 @@ if sys.platform == "win32":
     _FILE_ATTRIBUTE_NORMAL = 0x80
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 __all__ = ["Error", "Member", "TarReader", "extract"]
 
 REGTYPE = b"0"
@@ -239,8 +239,8 @@ class TarReader:
     """Reads the members of a tar archive front to back from a binary stream, without seeking.
 
     Parses ustar headers, pax extended headers and GNU long names, and verifies header
-    checksums, the end-of-archive marker, and that only zeros follow it, up to the end of the
-    stream. Iterate for members, and read the data of the current regular file with
+    checksums, the end-of-archive marker if there is one, and that only zeros follow it, up to
+    the end of the stream. Iterate for members, and read the data of the current regular file with
     ``chunks()``; data that is not read is skipped."""
 
     def __init__(self, stream: IO[bytes]) -> None:
@@ -298,7 +298,12 @@ class TarReader:
         raise Error("Archive contains data after the end-of-archive marker")
 
     def _header(self) -> Optional[bytes]:
-        """The next header, or None at the end-of-archive marker."""
+        """The next header, or None at the end-of-archive marker or at the end of the stream."""
+        if self.pos == len(self.buf):
+            self._more(_BLOCK)
+            if not self.buf:
+                # No end-of-archive marker, as in ruby's release tarballs
+                return None
         header = self._read(_BLOCK)
         if header == _EOF_BLOCK:
             # The marker is two zero blocks. tar and tarfile stop at one, and skip what follows.

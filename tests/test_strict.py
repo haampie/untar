@@ -382,8 +382,7 @@ def test_contiguous_files(tmp_path):
 def test_extended_header_without_member(tmp_path, type, end):
     """Dropping it silently would hide truncation."""
     content = record("path", "a") if type == b"x" else b"a\0"
-    match = "ends after" if end else "truncated"
-    rejects(member("first") + extended(type, content) + end, tmp_path, match)
+    rejects(member("first") + extended(type, content) + end, tmp_path, "ends after")
 
 
 def test_extended_headers_are_limited_per_member(tmp_path):
@@ -416,8 +415,8 @@ TWO_MEMBERS = make_tar(
 @pytest.mark.parametrize(
     "archive,error",
     [
-        (TWO_MEMBERS, "truncated"),
-        (TWO_MEMBERS[:1024], "truncated"),
+        (TWO_MEMBERS[: 1024 + 100], "truncated"),
+        (TWO_MEMBERS + bytes(100), "truncated"),
         (TWO_MEMBERS + bytes(512), "truncated"),
         (
             TWO_MEMBERS[:1024] + bytes(512) + TWO_MEMBERS[1024:] + bytes(1024),
@@ -425,14 +424,28 @@ TWO_MEMBERS = make_tar(
         ),
         (b"", "empty"),
         (gzip.compress(b""), "empty"),
+        (gzip.compress(TWO_MEMBERS)[:-4], "truncated"),
     ],
 )
 def test_end_of_archive_marker(tmp_path, archive, error):
-    """F03, F04, F09: without two zero blocks at the end, truncation between members would
-    go unnoticed."""
+    """F03, F09: the end-of-archive marker is two zero blocks, and a header is complete."""
     rejects(archive, tmp_path, error)
     untar.extract(io.BytesIO(TWO_MEMBERS + bytes(1024)), str(tmp_path / "d"))
     assert sorted(os.listdir(tmp_path / "d")) == ["a", "b"]
+
+
+@pytest.mark.parametrize(
+    "archive,names",
+    [
+        (TWO_MEMBERS, ["a", "b"]),
+        (gzip.compress(TWO_MEMBERS), ["a", "b"]),
+        (TWO_MEMBERS[:1024], ["a"]),
+    ],
+)
+def test_end_of_archive_marker_missing(tmp_path, archive, names):
+    """F04: an archive may end after its last member, as ruby's release tarballs do."""
+    untar.extract(ReadOnly(archive), str(tmp_path))
+    assert sorted(os.listdir(tmp_path)) == names
 
 
 @pytest.mark.parametrize(
