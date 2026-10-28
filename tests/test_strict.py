@@ -424,6 +424,7 @@ TWO_MEMBERS = make_tar(
         ),
         (b"", "empty"),
         (gzip.compress(b""), "empty"),
+        (gzip.compress(TWO_MEMBERS)[:-4], "truncated"),
     ],
 )
 def test_end_of_archive_marker(tmp_path, archive, error):
@@ -433,18 +434,18 @@ def test_end_of_archive_marker(tmp_path, archive, error):
     assert sorted(os.listdir(tmp_path / "d")) == ["a", "b"]
 
 
-@pytest.mark.parametrize("compress", [False, True])
-def test_end_of_archive_marker_missing(tmp_path, compress):
-    """F04: an archive may end after its last member, as ruby's release tarballs do, which is
-    how a cut short archive ends too: of a compressed one, decompression fails."""
-    untar.extract(
-        ReadOnly(gzip.compress(TWO_MEMBERS) if compress else TWO_MEMBERS),
-        str(tmp_path / "d"),
-    )
-    assert sorted(os.listdir(tmp_path / "d")) == ["a", "b"]
-    untar.extract(io.BytesIO(TWO_MEMBERS[:1024]), str(tmp_path / "e"))
-    assert os.listdir(tmp_path / "e") == ["a"]
-    rejects(gzip.compress(TWO_MEMBERS)[:-4], tmp_path, "truncated")
+@pytest.mark.parametrize(
+    "archive,names",
+    [
+        (TWO_MEMBERS, ["a", "b"]),
+        (gzip.compress(TWO_MEMBERS), ["a", "b"]),
+        (TWO_MEMBERS[:1024], ["a"]),
+    ],
+)
+def test_end_of_archive_marker_missing(tmp_path, archive, names):
+    """F04: an archive may end after its last member, as ruby's release tarballs do."""
+    untar.extract(ReadOnly(archive), str(tmp_path))
+    assert sorted(os.listdir(tmp_path)) == names
 
 
 @pytest.mark.parametrize(

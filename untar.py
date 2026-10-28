@@ -302,8 +302,7 @@ class TarReader:
         if self.pos == len(self.buf):
             self._more(_BLOCK)
             if not self.buf:
-                # No end-of-archive marker, as in ruby's release tarballs: every reader that
-                # accepts it stops here. A compressed stream that is cut short fails to decompress.
+                # No end-of-archive marker, as in ruby's release tarballs
                 return None
         header = self._read(_BLOCK)
         if header == _EOF_BLOCK:
