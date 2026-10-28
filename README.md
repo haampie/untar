@@ -139,8 +139,10 @@ without a NUL or backslash inside, only links have a link target, and links, dir
 fifos cannot have a size. The rules are those of the default policy of
 [tar-minefield](https://github.com/haampie/tar-minefield), except that symlinks may point out of
 the archive, since untar does not follow them. The gzip checksum is always
-verified, and an archive must end with two zero blocks and only zeros after them, so that neither
-truncation between members nor a second archive after the first goes unnoticed.
+verified, and an archive may end after its last member or with two zero blocks, but only zeros may
+follow them, so that a second archive after the first does not go unnoticed. Without the two zero
+blocks, as in ruby's release tarballs, an uncompressed archive cut short between members cannot be
+told apart from a complete one; a compressed one fails to decompress.
 
 ## Development
 
