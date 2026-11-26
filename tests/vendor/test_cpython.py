@@ -90,7 +90,8 @@ def snapshot(root):
             rel = os.path.relpath(path, root).replace(os.sep, "/")
             s = os.lstat(path)
             if stat.S_ISLNK(s.st_mode):
-                out[rel] = ("s", os.readlink(path))
+                # The separators in a target are backslashes on Windows, or it leads nowhere
+                out[rel] = ("s", os.readlink(path).replace(os.sep, "/"))
             elif stat.S_ISDIR(s.st_mode):
                 out[rel] = ("d",)
             else:

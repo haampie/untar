@@ -10,13 +10,27 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 
 import pytest
 
 import untar
 
 FORMATS = [tarfile.USTAR_FORMAT, tarfile.GNU_FORMAT, tarfile.PAX_FORMAT]
-needs_symlinks = pytest.mark.skipif(sys.platform == "win32", reason="needs symlinks")
+
+
+def can_symlink() -> bool:
+    """Whether symlinks can be created here, which takes a privilege on Windows."""
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            os.symlink("target", os.path.join(d, "link"))
+        except OSError:
+            return False
+    return True
+
+
+needs_symlinks = pytest.mark.skipif(not can_symlink(), reason="needs symlinks")
+windows = pytest.mark.skipif(sys.platform != "win32", reason="Windows")
 
 
 def make_tar(members, format=tarfile.PAX_FORMAT, compress=False) -> bytes:
@@ -59,7 +73,8 @@ def snapshot(root):
             rel = os.path.relpath(path, root).replace(os.sep, "/")
             s = os.lstat(path)
             if stat.S_ISLNK(s.st_mode):
-                out[rel] = ("s", os.readlink(path))
+                # The separators in a target are backslashes on Windows, or it leads nowhere
+                out[rel] = ("s", os.readlink(path).replace(os.sep, "/"))
             elif stat.S_ISDIR(s.st_mode):
                 out[rel] = ("d",)
             else:
@@ -115,6 +130,8 @@ def test_same_tree_as_tarfile(tmp_path, format, compress):
 @pytest.mark.parametrize("format", ["gnu", "posix", "ustar", "v7", "oldgnu"])
 def test_archives_from_tar(tmp_path, format):
     src = tmp_path / "src"
+    if sys.platform == "win32" and format in ("ustar", "v7"):
+        pytest.skip("tar writes names in the code page of the system, not in UTF-8")
     for name, kind, payload, mode in SAMPLE:
         if format in ("ustar", "v7") and len(name) > 99:
             continue
@@ -380,28 +397,68 @@ def test_no_files_over_symlinks_to_nothing(tmp_path):
     assert sorted(os.listdir(tmp_path)) == ["link"]
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="dirs are pinned on Windows")
+def make_junction(path, target) -> None:
+    """Make the empty dir at path a junction to target, in place: the dir stays the same
+    one, and a handle that is open on it stays open."""
+    import _winapi
+    import ctypes
+    import struct
+
+    # A mount point: the name to substitute and the name to print, each with a NUL
+    names = [
+        ("\\??\\" + str(target)).encode("utf-16-le"),
+        str(target).encode("utf-16-le"),
+    ]
+    body = struct.pack("<4H", 0, len(names[0]), len(names[0]) + 2, len(names[1]))
+    body += names[0] + b"\0\0" + names[1] + b"\0\0"
+    data = struct.pack("<IHH", 0xA0000003, len(body), 0) + body
+    # FILE_WRITE_ATTRIBUTES is enough, sharing everything, without following a link
+    handle = _winapi.CreateFile(str(path), 0x100, 7, 0, 3, 0x02200000, 0)
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        arguments = (ctypes.c_void_p(handle), 0x000900A4, data, len(data), None, 0)
+        if not kernel32.DeviceIoControl(
+            *arguments, ctypes.byref(ctypes.c_ulong()), None
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        _winapi.CloseHandle(handle)
+
+
+@windows
 def test_pinned_dirs_cannot_be_swapped(tmp_path):
     """Windows has no dir file descriptors: dirs are held open without sharing delete
-    access, so that neither they nor their ancestors can be renamed or removed, and nothing
-    on the path to an entry can be swapped for a junction or symlink."""
+    access, so that neither they nor their ancestors can be renamed or removed. An open dir
+    also holds a keeper, a file that cannot be removed, and a dir that is not empty cannot
+    be made a junction. So nothing on the path to an entry can be swapped for a link."""
     parent = tmp_path / "grandparent" / "parent"
     (parent / "dir").mkdir(parents=True)
+    (tmp_path / "target").mkdir()
     d = untar._open_dir(str(parent), "dir")
     try:
         for path in [parent / "dir", parent, parent.parent]:
             with pytest.raises(PermissionError):
                 os.rename(path, tmp_path / "moved")
-        with pytest.raises(PermissionError):
+        with pytest.raises(OSError):
             os.rmdir(parent / "dir")
+        with pytest.raises(OSError, match="not empty"):
+            make_junction(parent / "dir", tmp_path / "target")
+        (keeper,) = os.listdir(parent / "dir")
+        for remove in (os.unlink, lambda path: os.rename(path, tmp_path / "keeper")):
+            with pytest.raises(PermissionError):
+                remove(parent / "dir" / keeper)
         # Entries are created in it as usual
         (parent / "dir" / "f").write_text("x")
+        (parent / "dir" / "f").unlink()
     finally:
         untar._close(d)
+    # Nothing is left of the keeper, and what is no longer open can be changed again
+    assert os.listdir(parent / "dir") == []
+    make_junction(parent / "dir", tmp_path / "target")
     os.rename(parent.parent, tmp_path / "moved")
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="junctions are of Windows")
+@windows
 def test_no_entries_through_junctions(tmp_path):
     """A junction is a dir to lstat, but leads elsewhere, like a symlink."""
     import _winapi
@@ -410,9 +467,109 @@ def test_no_entries_through_junctions(tmp_path):
     _winapi.CreateJunction(str(tmp_path / "target"), str(tmp_path / "junction"))
     with pytest.raises(untar.Error, match="not a directory"):
         untar._open_dir(str(tmp_path), "junction")
+    assert os.listdir(tmp_path / "target") == []
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="junctions are of Windows")
+#: A dir that stays empty for a while, a dir with entries, and files
+IN_FLIGHT = [
+    ("pkg", "d", None, 0o755),
+    ("pkg/empty", "d", None, 0o755),
+    ("pkg/sub", "d", None, 0o755),
+    ("pkg/sub/f", "f", b"f", 0o644),
+    ("top", "f", b"top", 0o644),
+]
+
+
+@windows
+def test_dirs_in_use_cannot_be_made_junctions(tmp_path, monkeypatch):
+    """Whenever the path of a dir is used, the dir is open and holds its keeper: before the
+    first member, while tmp is empty; between members; and after the last entry has left
+    tmp, when it is listed and removed."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    attempts = []
+
+    def attack(self):
+        for d in [self.tmp, *self.dirs]:
+            with pytest.raises(OSError, match="not empty"):
+                make_junction(d, elsewhere)
+            attempts.append(str(d))
+
+    add, finish = untar._Extractor.add, untar._Extractor.finish
+
+    def attacked_add(self, member, reader):
+        attack(self)
+        add(self, member, reader)
+        attack(self)
+
+    def attacked_finish(self):
+        root = finish(self)
+        attack(self)
+        return root
+
+    monkeypatch.setattr(untar._Extractor, "add", attacked_add)
+    monkeypatch.setattr(untar._Extractor, "finish", attacked_finish)
+    untar.extract(io.BytesIO(make_tar(IN_FLIGHT)), str(tmp_path / "actual"))
+    tarfile_extract(make_tar(IN_FLIGHT), tmp_path / "expected")
+    assert snapshot(tmp_path / "actual") == snapshot(tmp_path / "expected")
+    assert os.listdir(elsewhere) == []
+    # tmp before the first member and after the last, and the open dirs in between
+    assert len(attempts) > 2 * len(IN_FLIGHT) + 1
+
+
+@windows
+@pytest.mark.parametrize("function", ["_open_dir", "_keeper"])
+@pytest.mark.parametrize("call", [1, 3], ids=["tmp", "pkg/empty"])
+def test_dirs_made_junctions_while_they_are_opened(
+    tmp_path, monkeypatch, function, call
+):
+    """A dir can be made a junction between its creation and its opening: what is opened is
+    asked whether it is a plain dir. It can also between that check and the creation of its
+    keeper: the keeper is created from the handle of the dir, which the system refuses in a
+    junction, where a path would lead to the junction's target."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    original = getattr(untar, function)
+    calls = []
+
+    def swapped(*args):
+        calls.append(args)
+        if len(calls) == call:
+            dir = (
+                os.path.join(*args) if len(args) == 2 else untar._final_path(*args, "")
+            )
+            make_junction(dir, elsewhere)
+        return original(*args)
+
+    monkeypatch.setattr(untar, function, swapped)
+    with pytest.raises((untar.Error, OSError)):
+        untar.extract(io.BytesIO(make_tar(IN_FLIGHT)), str(tmp_path / "dest"))
+    assert os.listdir(tmp_path / "dest") == [] and os.listdir(elsewhere) == []
+
+
+@windows
+def test_no_entries_through_dirs_made_junctions(tmp_path, monkeypatch):
+    """A dir that is closed and empty can be made a junction. A later member below it is
+    refused, and the junction is removed with tmp, not what it leads to."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "theirs").write_text("theirs")
+    add = untar._Extractor.add
+
+    def attacked_add(self, member, reader):
+        add(self, member, reader)
+        if member.name == "top":
+            make_junction(os.path.join(self.tmp, "pkg", "empty"), elsewhere)
+
+    monkeypatch.setattr(untar._Extractor, "add", attacked_add)
+    members = IN_FLIGHT + [("pkg/empty/evil", "f", b"evil", 0o644)]
+    with pytest.raises(untar.Error, match="not a directory"):
+        untar.extract(io.BytesIO(make_tar(members)), str(tmp_path / "dest"))
+    assert os.listdir(tmp_path / "dest") == []
+    assert os.listdir(elsewhere) == ["theirs"]
+
+
+@windows
 def test_dest_junction(tmp_path):
     """dest may lead through a junction, which is resolved once, rather than by every
     call."""
@@ -424,21 +581,41 @@ def test_dest_junction(tmp_path):
     assert (tmp_path / "real" / "pkg" / "bin" / "app").read_bytes() == b"#!/bin/sh\n"
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="dests are resolved on Windows")
+@windows
 def test_dest_swapped_while_opened(tmp_path, monkeypatch):
-    """If the path to tmp no longer resolves to itself once tmp is pinned, a dir on it was
-    swapped for a junction or symlink."""
-    realpath = os.path.realpath
-    calls = []
+    """If tmp, once it is open, is not where the resolved dest leads, a dir on the way was
+    swapped for a junction or symlink after dest was resolved."""
+    import _winapi
 
-    def swapped(path):
-        calls.append(path)
-        return realpath(path) if len(calls) == 1 else str(tmp_path / "elsewhere")
+    (tmp_path / "parent" / "dest").mkdir(parents=True)
+    (tmp_path / "elsewhere" / "dest").mkdir(parents=True)
+    resolve_dest = untar._resolve_dest
 
-    monkeypatch.setattr(os.path, "realpath", swapped)
+    def swapped(dest):
+        resolved = resolve_dest(dest)
+        os.rename(tmp_path / "parent", tmp_path / "moved")
+        _winapi.CreateJunction(str(tmp_path / "elsewhere"), str(tmp_path / "parent"))
+        return resolved
+
+    monkeypatch.setattr(untar, "_resolve_dest", swapped)
     with pytest.raises(untar.Error, match="changed while it was opened"):
-        untar.extract(io.BytesIO(make_tar(SAMPLE[:3])), str(tmp_path / "dest"))
-    assert os.listdir(tmp_path / "dest") == []
+        untar.extract(
+            io.BytesIO(make_tar(SAMPLE[:3])), str(tmp_path / "parent" / "dest")
+        )
+    assert os.listdir(tmp_path / "elsewhere" / "dest") == []
+    assert os.listdir(tmp_path / "moved" / "dest") == []
+
+
+@windows
+def test_dest_on_unc_path(tmp_path):
+    """A UNC path takes the prefix \\\\?\\UNC\\ where a path with a drive takes \\\\?\\."""
+    drive, rest = os.path.splitdrive(str(tmp_path))
+    unc = f"\\\\localhost\\{drive[0]}${rest}"
+    if not os.path.isdir(unc):
+        pytest.skip(f"cannot reach {unc}")
+    untar.extract(io.BytesIO(make_tar(SAMPLE)), os.path.join(unc, "actual"))
+    tarfile_extract(make_tar(SAMPLE), tmp_path / "expected")
+    assert snapshot(tmp_path / "actual") == snapshot(tmp_path / "expected")
 
 
 @needs_symlinks
@@ -650,6 +827,65 @@ def test_dest_symlink(tmp_path):
     tarfile_extract(make_tar(SAMPLE), tmp_path / "expected")
     assert (tmp_path / "link").is_symlink()
     assert snapshot(tmp_path / "real") == snapshot(tmp_path / "expected")
+
+
+#: Symlinks to a dir and into it: by a name, upwards, through another symlink, and with a
+#: trailing slash
+DIR_LINKS = [
+    ("chain", "s", "link", 0o777),
+    ("link", "s", "sub", 0o777),
+    ("slash", "s", "sub/", 0o777),
+    ("a/up", "s", "../sub", 0o777),
+    ("a/deep", "s", "../sub/deep", 0o777),
+    ("a/file", "s", "../sub/deep/f", 0o777),
+    ("sub/self", "s", ".", 0o777),
+    ("sub/deep/parent", "s", "..", 0o777),
+]
+DIR_LINKED = [("sub", "d", None, 0o755), ("sub/deep/f", "f", b"x", 0o644)]
+
+
+@needs_symlinks
+@pytest.mark.parametrize("links_first", [True, False])
+def test_symlinks_lead_to_dirs(tmp_path, links_first):
+    """A symlink leads to its target wherever the target is in the archive. On Windows, a
+    symlink is one to a file or one to a dir from its creation, and the separators in its
+    target are backslashes: a symlink to a dir that is extracted after it is made anew."""
+    members = DIR_LINKS + DIR_LINKED if links_first else DIR_LINKED + DIR_LINKS
+    dest = tmp_path / "dest"
+    untar.extract(io.BytesIO(make_tar(members)), str(dest))
+    for link in ("chain", "link", "slash", "a/up", "sub/self", "sub/deep/parent"):
+        assert sorted(os.listdir(dest / link)) == ["deep", "self"], link
+    assert sorted(os.listdir(dest / "a" / "deep")) == ["f", "parent"]
+    assert (dest / "a" / "file").read_bytes() == b"x"
+    assert (dest / "chain" / "self" / "deep" / "parent" / "deep" / "f").read_bytes()
+    assert snapshot(dest)["a/file"] == ("s", "../sub/deep/f")
+
+
+@needs_symlinks
+@pytest.mark.parametrize("kind", ["s", "h"])
+def test_swapped_files_are_not_copied(tmp_path, monkeypatch, kind, dir_fd):
+    """Where links are not supported, the file that a link leads to is copied. If that file
+    is swapped for a symlink after it was found to be a file, what the symlink leads to is
+    not read."""
+    secret = tmp_path / "secret"
+    secret.write_bytes(b"secret")
+    lstat, symlink = untar._lstat, os.symlink
+
+    def swapped(parent, name):
+        s = lstat(parent, name)
+        if name == "f" and s is not None:
+            path, fd = untar._at(parent, name)
+            os.unlink(path, dir_fd=fd)
+            symlink(str(secret), path, dir_fd=fd)
+        return s
+
+    monkeypatch.setattr(untar, "_lstat", swapped)
+    monkeypatch.setattr(os, "symlink", fail_with_eperm)
+    monkeypatch.setattr(os, "link", fail_with_eperm)
+    members = [("f", "f", b"x", 0o644), ("l", kind, "f", 0o644)]
+    with pytest.raises((untar.Error, OSError)):
+        untar.extract(io.BytesIO(make_tar(members)), str(tmp_path / "dest"))
+    assert os.listdir(tmp_path / "dest") == []
 
 
 @pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="POSIX")

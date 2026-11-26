@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 import pytest
-from test_untar import fail_with_eperm
+from test_untar import can_symlink, fail_with_eperm
 
 import untar
 
@@ -55,7 +55,11 @@ def entry(path: Path) -> dict:
     """The entry of one path, as in the manifests, without executable bits on Windows."""
     st = os.lstat(path)
     if stat.S_ISLNK(st.st_mode):
-        return {"kind": "symlink", "target": os.readlink(path)}
+        # The separators in a target are backslashes on Windows, or it leads nowhere
+        return {
+            "kind": "symlink",
+            "target": os.readlink(str(path)).replace(os.sep, "/"),
+        }
     if stat.S_ISDIR(st.st_mode):
         return {"kind": "directory"}
     data = path.read_bytes()
@@ -105,7 +109,7 @@ def test_case(tmp_path, monkeypatch, case, links):
     if links == "unsupported":
         monkeypatch.setattr(os, "symlink", fail_with_eperm)
         monkeypatch.setattr(os, "link", fail_with_eperm)
-    elif sys.platform == "win32" and any(
+    elif not can_symlink() and any(
         e["kind"] == "symlink" for e in info.get("tree", [])
     ):
         pytest.skip("needs symlinks")

@@ -64,13 +64,19 @@ archive, as the command line does.
   Where the platform or filesystem does not support links, the file a link points to is copied
   instead, and a symlink that cannot be copied (one to a directory, or to a target outside the
   archive) is an error rather than silently dropped.
+  On Windows, where creating symlinks takes a privilege or developer mode, the separators in a
+  symlink's target are stored as backslashes, and a symlink to a directory in the archive is created
+  as one, also when that directory comes later in the archive: other symlinks lead nowhere there.
 - **Race-free directory traversal:** On POSIX, entries are created relative to open directory file
   descriptors (`dir_fd`), preventing time-of-check-to-time-of-use (TOCTOU) races where a directory
   is swapped for a symlink during extraction and avoiding OS `PATH_MAX` limits. On Windows, which
   lacks `dir_fd`, `untar` uses extended-length paths (`\\?\`), creates files with
-  `CREATE_NEW | FILE_FLAG_OPEN_REPARSE_POINT`, and holds ancestor directories open without delete
-  sharing so they cannot be renamed, removed, or replaced with junctions or symlinks during
-  extraction.
+  `CREATE_NEW | FILE_FLAG_OPEN_REPARSE_POINT`, and keeps every directory on the path to an entry
+  open: without delete sharing, so that neither the directory nor its ancestors can be renamed or
+  removed, and with a file in it that only `untar` can remove, since Windows lets only an empty
+  directory be made a junction or symlink. Whether a directory is a plain one is asked of its open
+  handle rather than of its path, and so is where the destination is once links on the way to it
+  are resolved.
 - **Strict, unambiguous parsing:** `untar` follows the default policy of
   [tar-minefield](https://stoppels.ch/tar) to reject ambiguous archives that different tar
   implementations interpret differently (such as conflicting extended headers, non-octal numeric

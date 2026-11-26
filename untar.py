@@ -17,10 +17,13 @@ from typing import IO, Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 if sys.platform == "win32":
     import _winapi
+    import ctypes
     import msvcrt
+    from ctypes.wintypes import DWORD, HANDLE, LPWSTR, ULONG, USHORT
 
     _GENERIC_READ = 0x80000000
     _GENERIC_WRITE = 0x40000000
+    _DELETE = 0x00010000
     _FILE_SHARE_READ_WRITE = 0x1 | 0x2
     _CREATE_NEW = 1
     _OPEN_EXISTING = 3
@@ -28,6 +31,80 @@ if sys.platform == "win32":
     _FILE_ATTRIBUTE_READONLY = 0x1
     _FILE_ATTRIBUTE_NORMAL = 0x80
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _ntdll = ctypes.WinDLL("ntdll")
+
+    class _UnicodeString(ctypes.Structure):
+        _fields_ = [("Length", USHORT), ("MaximumLength", USHORT), ("Buffer", LPWSTR)]
+
+    class _ObjectAttributes(ctypes.Structure):
+        _fields_ = [
+            ("Length", ULONG),
+            ("RootDirectory", HANDLE),
+            ("ObjectName", ctypes.POINTER(_UnicodeString)),
+            ("Attributes", ULONG),
+            ("Security", ctypes.c_void_p * 2),
+        ]
+
+    def _fd(handle: int, flags: int) -> int:
+        """Wrap ``handle`` in a file descriptor, which owns it from then on."""
+        try:
+            return msvcrt.open_osfhandle(handle, flags | os.O_NOINHERIT)
+        except BaseException:
+            _winapi.CloseHandle(handle)
+            raise
+
+    def _is_plain_dir(handle: int) -> bool:
+        """Whether ``handle`` is open on a directory without a reparse point, which a junction
+        and a symlink have. This asks what is open, not what a path leads to by now."""
+        info = (DWORD * 2)()  # FILE_ATTRIBUTE_TAG_INFO, which is information class 9
+        if not _kernel32.GetFileInformationByHandleEx(HANDLE(handle), 9, info, 8):
+            raise ctypes.WinError(ctypes.get_last_error())
+        links = stat.FILE_ATTRIBUTE_DIRECTORY | stat.FILE_ATTRIBUTE_REPARSE_POINT
+        return info[0] & links == stat.FILE_ATTRIBUTE_DIRECTORY
+
+    def _keeper(handle: int) -> int:
+        """Create the keeper of the directory that ``handle`` is open on: a file that is not
+        shared, so that nobody else can open it to remove it, and that is deleted when its
+        handle is closed. Its name is resolved from ``handle``, which the system refuses in a
+        directory that was made a junction, where a path would lead to the junction's target."""
+        name = _UnicodeString(len(_KEEPER) * 2, len(_KEEPER) * 2, _KEEPER)
+        # Names are case-insensitive (0x40)
+        attributes = _ObjectAttributes(
+            ctypes.sizeof(_ObjectAttributes), handle, ctypes.pointer(name), 0x40
+        )
+        keeper, status = HANDLE(), (ctypes.c_void_p * 2)()
+        # A new (2) file (0x40) that is deleted on close (0x1000)
+        error = _ntdll.NtCreateFile(
+            *(ctypes.byref(keeper), _DELETE, ctypes.byref(attributes), status, None),
+            *(_FILE_ATTRIBUTE_NORMAL, 0, 2, 0x40 | 0x1000, None, 0),
+        )
+        if error < 0:
+            raise ctypes.WinError(_ntdll.RtlNtStatusToDosError(error))
+        return keeper.value or 0
+
+    def _final_path(handle: int, path: str) -> str:
+        """The extended-length path of what ``handle`` is open on, with the junctions, symlinks
+        and substituted drives on the way to it resolved; ``path`` on a volume that cannot tell,
+        such as a RAM disk without a mount point."""
+        buffer = ctypes.create_unicode_buffer(32768)
+        found = _kernel32.GetFinalPathNameByHandleW(HANDLE(handle), buffer, 32768, 0)
+        return buffer.value if found else path
+
+    def _resolve_dest(dest: str) -> str:
+        """Resolve the links on the way to ``dest`` once, into an extended-length path, which
+        has no length limit and is not interpreted further."""
+        if not dest.startswith("\\\\?\\"):
+            # A UNC path takes another prefix: \\?\UNC\server\share
+            dest = "\\\\?\\" + ("UNC" + dest[1:] if dest.startswith("\\\\") else dest)
+        handle = _winapi.CreateFile(
+            dest, 0, 7, 0, _OPEN_EXISTING, _FILE_FLAG_BACKUP_SEMANTICS, 0
+        )
+        try:
+            return _final_path(handle, dest)
+        finally:
+            _winapi.CloseHandle(handle)
+
 
 __version__ = "1.0.0.dev0"
 __all__ = ["Error", "Member", "TarReader", "UnsupportedCompression", "extract"]
@@ -79,6 +156,8 @@ _POSIX_MAGICS = (b"ustar\x0000", b"ustar\0\0\0")
 _V7_MAGIC = bytes(8)
 _OTHER_MAGICS = (b"ustar  \0", _V7_MAGIC)
 _MAX_OPEN_DIRS = 64
+# The name of the keepers of this process on Windows: no archive can name a member like it.
+_KEEPER = f".untar-{os.urandom(8).hex()}"
 # Limit directory nesting depth; deep paths degrade to quadratic creation time on macOS.
 _MAX_DEPTH = 1024
 _DRIVES = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -667,6 +746,8 @@ _DIR_FD = all(
 )
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_BINARY = getattr(os, "O_BINARY", 0)
+# Without blocking, should the entry be a FIFO by now.
+_SOURCE_FLAGS = os.O_RDONLY | _O_NOFOLLOW | _O_BINARY | getattr(os, "O_NONBLOCK", 0)
 _DEST_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
 _DIR_FLAGS = _DEST_FLAGS | _O_NOFOLLOW
 _FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_BINARY
@@ -684,23 +765,39 @@ def _create(path: str, dir_fd: Optional[int], mode: int) -> int:
         handle = _winapi.CreateFile(
             path, _GENERIC_WRITE, _FILE_SHARE_READ_WRITE, 0, _CREATE_NEW, flags, 0
         )
-        try:
-            return msvcrt.open_osfhandle(handle, os.O_NOINHERIT)
-        except BaseException:
-            _winapi.CloseHandle(handle)
-            raise
+        return _fd(handle, 0)
     return os.open(path, _FILE_FLAGS, mode, dir_fd=dir_fd)
 
 
+def _open_file(path: str, dir_fd: Optional[int]) -> int:
+    """Open an extracted file for reading, and check what was opened: a symlink that has taken
+    its place since is not followed, and a FIFO not waited for."""
+    if sys.platform == "win32":
+        handle = _winapi.CreateFile(
+            *(path, _GENERIC_READ, _FILE_SHARE_READ_WRITE, 0, _OPEN_EXISTING),
+            *(_FILE_FLAG_OPEN_REPARSE_POINT, 0),
+        )
+        fd = _fd(handle, os.O_RDONLY | os.O_BINARY)
+    else:
+        fd = os.open(path, _SOURCE_FLAGS, dir_fd=dir_fd)
+    s = os.fstat(fd)
+    link = getattr(s, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    if link or not stat.S_ISREG(s.st_mode):
+        os.close(fd)
+        raise Error(f"{path} changed while it was extracted")
+    return fd
+
+
 class _Pinned(str):
-    """A directory path on Windows paired with an open handle that omits FILE_SHARE_DELETE,
-    preventing the directory and its ancestors from being renamed, deleted, or replaced with a
-    junction or symlink while open."""
+    """A directory path on Windows with two open handles. The one on the directory omits
+    FILE_SHARE_DELETE, so that neither the directory nor its ancestors can be renamed or
+    deleted. The other is on its keeper, a file in it that nobody else can open or remove, and
+    that is deleted when the handle is closed: a directory that is not empty cannot be made a
+    junction or a symlink. Together they keep the path leading to the same directory for as long
+    as it is open."""
 
     handle: int
-
-
-_SetFileTime: Any = None
+    keeper: int
 
 
 def _set_mtime(fd: int, mtime: float) -> None:
@@ -710,15 +807,10 @@ def _set_mtime(fd: int, mtime: float) -> None:
     else:
         # Windows os.utime does not accept file descriptors; call SetFileTime on the OS handle
         # (in 100 ns intervals since 1601-01-01).
-        import ctypes
-
-        global _SetFileTime
-        if _SetFileTime is None:
-            _SetFileTime = ctypes.WinDLL("kernel32", use_last_error=True).SetFileTime
-            _SetFileTime.argtypes = (ctypes.c_void_p,) * 4
         t = ctypes.c_uint64(int((mtime + 11644473600) * 10**7))
         handle = msvcrt.get_osfhandle(fd)
-        if not _SetFileTime(handle, None, ctypes.byref(t), ctypes.byref(t)):
+        times = (None, ctypes.byref(t), ctypes.byref(t))
+        if not _kernel32.SetFileTime(HANDLE(handle), *times):
             raise ctypes.WinError(ctypes.get_last_error())
 
 
@@ -744,10 +836,8 @@ def _open_dir(parent: Dir, name: str) -> Dir:
                 ) from e
             raise
     path = os.path.join(parent, name)
-    d = path
     if sys.platform == "win32":
-        d = _Pinned(path)
-        d.handle = _winapi.CreateFile(
+        handle = _winapi.CreateFile(
             path,
             _GENERIC_READ,
             _FILE_SHARE_READ_WRITE,
@@ -756,17 +846,19 @@ def _open_dir(parent: Dir, name: str) -> Dir:
             _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
             0,
         )
-    # Verify after pinning that the entry is a real directory and not a reparse point (junction).
-    try:
-        s = os.lstat(path)
-        if not stat.S_ISDIR(s.st_mode) or getattr(s, "st_file_attributes", 0) & (
-            stat.FILE_ATTRIBUTE_REPARSE_POINT
-        ):
-            raise Error(f"Archive writes through {name}, which is not a directory")
-    except BaseException:
-        _close(d)
-        raise
-    return d
+        d = _Pinned(path)
+        d.handle = d.keeper = handle
+        try:
+            if not _is_plain_dir(handle):
+                raise Error(f"Archive writes through {name}, which is not a directory")
+            d.keeper = _keeper(handle)
+        except BaseException:
+            _close(d)
+            raise
+        return d
+    if not stat.S_ISDIR(os.lstat(path).st_mode):
+        raise Error(f"Archive writes through {name}, which is not a directory")
+    return path
 
 
 def _lstat(parent: Dir, name: str) -> Optional[os.stat_result]:
@@ -781,6 +873,8 @@ def _close(d: Dir) -> None:
     if isinstance(d, int):
         os.close(d)
     elif sys.platform == "win32" and isinstance(d, _Pinned):
+        if d.keeper != d.handle:
+            _winapi.CloseHandle(d.keeper)
         _winapi.CloseHandle(d.handle)
 
 
@@ -800,10 +894,15 @@ def _remove_files(d: Dir) -> List[str]:
         path, dir_fd = _at(d, name)
         with contextlib.suppress(OSError):
             s = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
-            if stat.S_ISDIR(s.st_mode):
-                subdirs.append(name)
-            else:
+            if not stat.S_ISDIR(s.st_mode):
                 os.unlink(path, dir_fd=dir_fd)
+            elif (
+                getattr(s, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                # A junction: remove it, and nothing of where it leads.
+                os.rmdir(path, dir_fd=dir_fd)
+            else:
+                subdirs.append(name)
     return subdirs
 
 
@@ -850,6 +949,8 @@ class _Extractor:
         self.links: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
         # Paths of copied symlinks; no subsequent member may be extracted at or beneath them.
         self.copies: Set[Tuple[str, ...]] = set()
+        # Symlinks on Windows that lead to nothing yet, as (path, target).
+        self.dangling: List[Tuple[List[str], str]] = []
         self.names: List[str] = []
         self.dirs: List[Dir] = []
 
@@ -857,10 +958,9 @@ class _Extractor:
             self.dest: Dir = os.dup(dest)
         else:
             os.makedirs(dest, exist_ok=True)
-            # Resolve symlinks and junctions on the destination path once up front.
-            dest = os.path.realpath(dest) if _WINDOWS else os.path.abspath(dest)
-            if _WINDOWS and not dest.startswith("\\\\?\\"):
-                dest = "\\\\?\\" + dest
+            dest = os.path.abspath(dest)
+            if sys.platform == "win32":
+                dest = _resolve_dest(dest)
             self.dest = os.open(dest, _DEST_FLAGS) if _DIR_FD else dest
         while True:
             tmp_name = f".untar-{os.urandom(4).hex()}"
@@ -871,14 +971,17 @@ class _Extractor:
             except FileExistsError:
                 pass
         self.tmp_name = tmp_name
-        self.tmp = _open_dir(self.dest, tmp_name)
-        if _WINDOWS:
+        try:
+            self.tmp = _open_dir(self.dest, tmp_name)
+        except (Error, OSError):
+            _rmdir(self.dest, tmp_name)
+            raise
+        if sys.platform == "win32" and isinstance(self.tmp, _Pinned):
             # Verify that no ancestor of dest was swapped for a junction or symlink before tmp was
-            # pinned.
-            path, _ = _at(self.dest, tmp_name)
-            if os.path.normcase(os.path.realpath(path)) != os.path.normcase(path):
-                _close(self.tmp)
-                _rmdir(self.dest, tmp_name)
+            # pinned: the open tmp is where the path that it was created by leads.
+            path = os.path.normcase(self.tmp)
+            if os.path.normcase(_final_path(self.tmp.handle, path)) != path:
+                self.close()
                 raise Error(f"Destination {dest} changed while it was opened")
 
         # Probe the destination filesystem once to see whether umask, default ACLs, or setgid
@@ -1055,8 +1158,12 @@ class _Extractor:
         elif member.issym():
             if not member.linkname:
                 raise Error(f"Archive contains symlink {member.name} without a target")
+            # A symlink on Windows is one to a file or one to a directory from its creation, and
+            # the separators in its target are backslashes: any other symlink leads nowhere.
+            to_dir = _WINDOWS and self._leads_to_dir(parts, member.linkname)
+            link = member.linkname.replace("/", os.sep)
             try:
-                os.symlink(member.linkname, path, dir_fd=dir_fd)
+                os.symlink(link, path, bool(to_dir), dir_fd=dir_fd)
             except OSError as e:
                 if not _unsupported(e):
                     raise
@@ -1073,6 +1180,8 @@ class _Extractor:
                 if not self._copy(target, parts):
                     self.links[key] = tuple(target)
                 return
+            if to_dir is None:
+                self.dangling.append((parts, member.linkname))
             if self.chown:
                 os.chown(path, -1, self.gid, dir_fd=dir_fd, follow_symlinks=False)  # type: ignore
         elif member.islnk():
@@ -1091,6 +1200,34 @@ class _Extractor:
             raise Error(
                 f"Archive contains {member.name} of unsupported type {member.type!r}"
             )
+
+    def _leads_to_dir(self, parts: List[str], linkname: str) -> Optional[bool]:
+        """Whether the symlink ``parts`` to ``linkname`` leads to a directory in the archive:
+        None if it leads to nothing, which may be extracted later."""
+        target = _resolve(parts, linkname)
+        if target is None:
+            return False
+        try:
+            return stat.S_ISDIR(os.stat(os.path.join(str(self.tmp), *target)).st_mode)
+        except OSError:
+            return None
+
+    def _retarget(self) -> None:
+        """Make the symlinks that lead to a directory extracted after them symlinks to a
+        directory. One may lead there through another that is made anew, so repeat for as long
+        as that helps, and for as many symlinks as Windows follows on one path."""
+        for _ in range(32):
+            rest = []
+            for parts, linkname in self.dangling:
+                if self._leads_to_dir(parts, linkname):
+                    path, _ = _at(self._dir(parts[:-1]), parts[-1])
+                    os.unlink(path)
+                    os.symlink(linkname.replace("/", os.sep), path, True)
+                else:
+                    rest.append((parts, linkname))
+            if len(rest) == len(self.dangling):
+                break
+            self.dangling = rest
 
     def _open_existing(self, parts: List[str]) -> Tuple[Dir, List[Dir]]:
         """Open existing directory ``tmp/parts`` from the deepest open ancestor on the stack."""
@@ -1155,10 +1292,12 @@ class _Extractor:
                         raise
             if not stat.S_ISREG(s.st_mode):
                 return False
-            src = os.open(path, os.O_RDONLY | _O_BINARY, dir_fd=dir_fd)
+            # The entry may have been swapped since lstat: copy what is opened, and its mode.
+            src = _open_file(path, dir_fd)
             try:
+                mode = stat.S_IMODE(os.fstat(src).st_mode)
                 chunks = iter(lambda: os.read(src, _CHUNK), b"")
-                self._file(parent, dest[-1], stat.S_IMODE(s.st_mode), chunks)
+                self._file(parent, dest[-1], mode, chunks)
             finally:
                 os.close(src)
             return True
@@ -1190,8 +1329,10 @@ class _Extractor:
                         f"{'/'.join(target)}, which is not extracted"
                     )
 
+        if self.dangling:
+            self._retarget()
         src = self._dir(root)
-        names = os.listdir(src)
+        names = [name for name in os.listdir(src) if name != _KEEPER]
         for name in names:
             if _lstat(self.dest, name) is not None:
                 raise Error(f"{name} exists in the destination")
