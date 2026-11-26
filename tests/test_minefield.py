@@ -1,8 +1,13 @@
 """Run the vendored tar-minefield test suite against untar.
 
-untar must extract the expected tree for every case with verdict "accept" and reject every case
+untar must extract the expected tree for every case with verdict "accept", and reject every case
 with verdict "reject" (leaving the destination empty and writing nothing outside it), except for
-the cases listed in ACCEPTED and REJECTED below."""
+those in ACCEPTED. A case with verdict "tolerate" may be rejected or extracted to its expected
+tree: REJECTED lists the ones untar rejects.
+
+An ``untar.Error`` counts as a rejection, and so does an ``OSError``, with which the operating
+system refuses an operation such as creating a file that exists. Any other exception is a crash,
+and fails the test."""
 
 import hashlib
 import json

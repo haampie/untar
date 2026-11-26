@@ -47,7 +47,10 @@ with status 2 on the CLI).
 
 - **Atomic against archive errors:** Members are extracted into a temporary directory inside the
   destination and moved into place only after the full stream (including the gzip checksum) has been
-  read and verified. A truncated or invalid archive leaves the destination untouched.
+  read and verified. An invalid archive leaves the destination untouched, as does a truncated one
+  that is compressed or cut inside a member. The end-of-archive marker is optional (ruby's release
+  tarballs lack it), so an uncompressed archive cut exactly between two members cannot be told
+  apart from a complete one.
 - **No traversal or overwrites:** Absolute paths, `..` components, backslashes, and Windows drive
   letters are rejected. Directories are opened with `O_NOFOLLOW` and files are created with
   `O_EXCL | O_NOFOLLOW`, so `untar` never writes through symlinks or overwrites existing files.

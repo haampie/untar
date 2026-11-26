@@ -332,8 +332,9 @@ class TarReader:
             self._skip(self.remaining + padding)
             self.remaining = 0
 
-            # Allow at most one extended header source per member so conflicting overrides cannot
-            # produce different trees across implementations.
+            # A member's name and link target each come from one source, and pax headers and GNU
+            # long names do not mix, so conflicting overrides cannot produce different trees
+            # across implementations.
             name: Optional[str] = None
             linkname: Optional[str] = None
             pax_size: Optional[int] = None
