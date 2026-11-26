@@ -26,6 +26,11 @@ The destination directory is created if it does not exist. If any top-level entr
 already exists in the destination, extraction fails and leaves the destination unchanged (exiting
 with status 2 on the CLI).
 
+An invalid or unsafe archive raises `untar.Error`. Operations that the operating system refuses
+raise `OSError` instead, notably `FileExistsError` for a name that occurs twice in an archive, since
+entries are never replaced. Catch `(untar.Error, OSError)` to handle every rejected archive, as the
+command line does.
+
 ### Options
 
 `untar.extract(src, dest, *, root_marker=None, file_mode=0o755, dir_mode=0o755, gid=None, mtime=None)`:
@@ -54,8 +59,10 @@ with status 2 on the CLI).
 - **No traversal or overwrites:** Absolute paths, `..` components, backslashes, and Windows drive
   letters are rejected. Directories are opened with `O_NOFOLLOW` and files are created with
   `O_EXCL | O_NOFOLLOW`, so `untar` never writes through symlinks or overwrites existing files.
-  Symlinks and hardlinks are extracted (or copied when the platform or filesystem does not support
-  links), while device nodes, FIFOs, and sparse files are rejected.
+  Symlinks and hardlinks are extracted, while device nodes, FIFOs, and sparse files are rejected.
+  Where the platform or filesystem does not support links, the file a link points to is copied
+  instead, and a symlink that cannot be copied (one to a directory, or to a target outside the
+  archive) is an error rather than silently dropped.
 - **Race-free directory traversal:** On POSIX, entries are created relative to open directory file
   descriptors (`dir_fd`), preventing time-of-check-to-time-of-use (TOCTOU) races where a directory
   is swapped for a symlink during extraction and avoiding OS `PATH_MAX` limits. On Windows, which

@@ -950,10 +950,7 @@ def test_links_are_copied_where_unsupported(tmp_path, monkeypatch, target_first)
     monkeypatch.setattr(os, "symlink", fail_with_eperm)
     monkeypatch.setattr(os, "link", fail_with_eperm)
     target = [("lib/libfoo.so.1", "f", b"foo", 0o644)]
-    links = [
-        ("lib/libfoo.so", "s", "libfoo.so.1", 0o777),
-        ("lib/sub", "s", "../lib", 0o777),
-    ]
+    links = [("lib/libfoo.so", "s", "libfoo.so.1", 0o777)]
     members = [("lib", "d", None, 0o755)] + (
         target + links if target_first else links + target
     )
@@ -962,7 +959,19 @@ def test_links_are_copied_where_unsupported(tmp_path, monkeypatch, target_first)
     for name in ("libfoo.so", "libfoo.so.1", "libfoo.a"):
         path = tmp_path / "lib" / name
         assert not path.is_symlink() and path.read_bytes() == b"foo"
-    assert (tmp_path / "lib" / "sub").is_dir()
+
+
+@pytest.mark.parametrize("target", ["lib", "lib/sub", "."])
+@pytest.mark.parametrize("target_first", [False, True])
+def test_symlinks_to_dirs_are_not_copied(tmp_path, monkeypatch, target, target_first):
+    """An empty dir in the place of the symlink would lose what it leads to without a word:
+    refuse it, whether the dir comes before the symlink or after it."""
+    monkeypatch.setattr(os, "symlink", fail_with_eperm)
+    dirs = [("lib/sub", "d", None, 0o755), ("lib/sub/f", "f", b"x", 0o644)]
+    link = [("lib64", "s", target, 0o777)]
+    rejects(
+        make_tar(dirs + link if target_first else link + dirs), tmp_path, "lib64 to"
+    )
 
 
 @pytest.mark.parametrize("target", ["/abs", "../up", "missing", "s"])
@@ -978,12 +987,12 @@ def test_symlinks_that_cannot_be_copied(tmp_path, monkeypatch, target):
     "entry",
     [("s", "f", b"y", 0o644), ("s/x", "f", b"y", 0o644), ("s", "d", None, 0o755)],
 )
-@pytest.mark.parametrize("target", ["dir", "later"])
+@pytest.mark.parametrize("target", ["file", "later"])
 def test_no_entries_at_or_below_copied_symlinks(tmp_path, monkeypatch, entry, target):
     """S10, S11: nothing is created over or through a symlink, nor over or through its
     copy, whether it is copied right away or after the last member."""
     monkeypatch.setattr(os, "symlink", fail_with_eperm)
-    members = [("dir", "d", None, 0o755), ("s", "s", target, 0o777), entry]
+    members = [("file", "f", b"x", 0o644), ("s", "s", target, 0o777), entry]
     rejects(make_tar(members), tmp_path, "at or below the symlink s")
 
 

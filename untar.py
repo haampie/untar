@@ -988,7 +988,8 @@ class _Extractor:
             except OSError as e:
                 if not _unsupported(e):
                     raise
-                # Fall back to copying internal symlink targets when symlinks are unavailable.
+                # Fall back to copying the file a symlink points to when symlinks are unavailable,
+                # and refuse a symlink that cannot be copied rather than dropping it.
                 target = _resolve(parts, member.linkname)
                 if target is None:
                     raise Error(
@@ -1036,7 +1037,8 @@ class _Extractor:
         return d, opened
 
     def _copy(self, source: List[str], dest: List[str], link: bool = False) -> bool:
-        """Hardlink or copy an already-extracted entry ``source`` to ``dest``."""
+        """Hardlink or copy an already-extracted entry ``source`` to ``dest``, and return whether
+        ``source`` is extracted. A directory can be neither hardlinked nor copied."""
         if not source:
             return False
         if link and tuple(source) in self.copies:
@@ -1060,8 +1062,11 @@ class _Extractor:
                     raise Error(
                         f"Archive hardlinks {'/'.join(source)}, which is a directory"
                     )
-                self._dir(dest)
-                return True
+                # An empty directory in its place would silently lose what the symlink led to.
+                raise Error(
+                    f"Archive contains symlink {'/'.join(dest)} to the directory "
+                    f"{'/'.join(source)}, which cannot be copied"
+                )
             if link:
                 dest_path, dest_fd = _at(parent, dest[-1])
                 try:
@@ -1150,6 +1155,14 @@ def extract(
     owner execute permission ``0o100``), and directories with ``dir_mode`` (which must include
     owner ``0o700``). If ``gid`` is set, extracted entries are assigned to that group; if ``mtime``
     is set (in seconds since the epoch), all extracted files receive that modification time.
+
+    Where links cannot be created, the file that a link points to is copied instead. A symlink
+    that cannot be copied (one to a directory, or to a target outside the archive) is an error.
+
+    Raises ``untar.Error`` for an archive that is invalid or unsafe, and ``OSError`` for an
+    operation that the operating system refuses: notably ``FileExistsError`` for a name that
+    occurs twice in the archive, since entries are never replaced. Catch
+    ``(untar.Error, OSError)`` to handle every rejected archive, as the command line does.
     """
     if isinstance(dest, int) and not _DIR_FD:
         raise ValueError("dest cannot be a file descriptor on this platform")
