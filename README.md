@@ -1,68 +1,85 @@
 # untar
 
-This package extracts tarballs fast and safely, and is deliberately restricted to the subset of tar
-features used to distribute software. It supports Python 3.6 and later.
+`untar` is a Python library for extracting tar archives with high performance and strong safety
+guarantees. It targets software distribution archives (source tarballs, packages, release artifacts)
+rather than filesystem backups, and supports Python 3.6 and later with no dependencies.
 
-It differs significantly from typical tar implementations: nothing is written outside the
-destination or through a symlink, existing files are never replaced, owners and permissions from
-the archive are not restored, and device files are rejected. On POSIX systems, entries are created
-relative to open directory file descriptors. That rules out races where a directory is swapped for
-a symlink between a check and its use, which implementations that work with paths are prone to.
-Archives that tar implementations parse differently are rejected, and extraction happens in a
-temporary directory, so an invalid or truncated archive leaves the destination untouched.
+## Usage
 
 ```python
 import untar
 
-# Extract an archive, from a path or any readable binary stream
+# Extract an archive from a file path or any readable binary stream (.tar or .tar.gz)
 untar.extract("pkg.tar.gz", "/opt/pkg")
 
-# Extract the dir that contains `.meta`, wherever it is in the archive
+# Extract the directory containing `.meta`, wherever it appears in the archive
 root = untar.extract("pkg.tar.gz", "/opt/pkg", root_marker=".meta")
 ```
 
-From the command line, like `tar xf pkg.tar.gz -C /opt/pkg`, with `-` to read standard input:
+From the command line (use `-` for standard input):
 
 ```console
 $ python -m untar pkg.tar.gz /opt/pkg
 ```
 
-Unlike tar, the destination is created if it does not exist, and an archive with an entry that
-already exists there is an error, which exits with status 2.
+The destination directory is created if it does not exist. If any top-level entry from the archive
+already exists in the destination, extraction fails and leaves the destination unchanged (exiting
+with status 2 on the CLI).
 
-## Scope
+### Options
 
-untar is for installing software from archives, not for restoring backups. Owners, groups,
-timestamps and permissions recorded in an archive describe the machine it was made on; on
-another machine they are meaningless at best and a liability at worst. So untar does not
-restore them: files are created with `file_mode` (without executable bits where the archive
-has none for the owner), dirs with `dir_mode`, optionally with group `gid`, and only regular
-files, dirs, symlinks and hardlinks are extracted.
+`untar.extract(src, dest, *, root_marker=None, file_mode=0o755, dir_mode=0o755, gid=None, mtime=None)`:
 
-Files get the time they are extracted, unless `mtime` gives them all one modification time, at
-the cost of a syscall per file. Pass it for autotools tarballs, where `configure` would otherwise
-be older than `configure.ac` and make would run autoconf again; a fixed value makes extractions
-reproducible.
+- `src`: a file path or any readable binary stream. Gzip compression is detected automatically from
+  the first two bytes.
+- `dest`: a directory path or, on POSIX, an open directory file descriptor.
+- `root_marker`: extract only the parent directory of the shallowest member with this filename, and
+  return that directory's path in the archive (similar to `tar --strip-components` when the nesting
+  depth is not known in advance). All other members must reside under that directory.
+- `file_mode`, `dir_mode`, `gid`: permissions and group applied to extracted files and directories.
+  Archive ownership and mode bits are ignored, except that a file only receives executable bits from
+  `file_mode` when the archive marks it executable by its owner (`0o100`).
+- `mtime`: optional modification time (in seconds since the epoch) applied to all extracted files.
+  By default, files keep their extraction timestamp; setting a uniform `mtime` avoids timestamp skew
+  in archives such as autotools releases where `configure` is stored before `configure.ac`.
 
-## Features
+## Safety
 
-- Streaming: the archive is read front to back once, without seeking, from a file, pipe or
-  network stream. Gzip is detected from the first bytes.
-- Fast parser: only the header fields that extraction needs are parsed (ustar, pax and GNU long
-  names).
-- Dynamic `--strip-components`: with `root_marker`, the parent of the shallowest member with
-  that name is extracted, like `tar --strip-components` with a count that is only known after
-  the last member.
-- No path length limits: entries are created relative to open dir file descriptors, or on
-  Windows by extended-length paths, so archives extract even where a member's full path would
-  exceed the operating system's limit. Members can be up to 1024 dirs deep, since on macOS,
-  creating an entry takes time linear in its depth.
+- **Atomic against archive errors:** Members are extracted into a temporary directory inside the
+  destination and moved into place only after the full stream (including the gzip checksum) has been
+  read and verified. A truncated or invalid archive leaves the destination untouched.
+- **No traversal or overwrites:** Absolute paths, `..` components, backslashes, and Windows drive
+  letters are rejected. Directories are opened with `O_NOFOLLOW` and files are created with
+  `O_EXCL | O_NOFOLLOW`, so `untar` never writes through symlinks or overwrites existing files.
+  Symlinks and hardlinks are extracted (or copied when the platform or filesystem does not support
+  links), while device nodes, FIFOs, and sparse files are rejected.
+- **Race-free directory traversal:** On POSIX, entries are created relative to open directory file
+  descriptors (`dir_fd`), preventing time-of-check-to-time-of-use (TOCTOU) races where a directory
+  is swapped for a symlink during extraction and avoiding OS `PATH_MAX` limits. On Windows, which
+  lacks `dir_fd`, `untar` uses extended-length paths (`\\?\`), creates files with
+  `CREATE_NEW | FILE_FLAG_OPEN_REPARSE_POINT`, and holds ancestor directories open without delete
+  sharing so they cannot be renamed, removed, or replaced with junctions or symlinks during
+  extraction.
+- **Strict, unambiguous parsing:** `untar` follows the default policy of
+  [tar-minefield](https://stoppels.ch/tar) to reject ambiguous archives that different tar
+  implementations interpret differently (such as conflicting extended headers, non-octal numeric
+  fields, non-UTF-8 paths, embedded NUL bytes, trailing data after the end-of-archive marker, or
+  sizes on non-file entries). Header fields that `untar` does not use (`uid`, `gid`, `mtime`,
+  `uname`, `gname`, and the ustar `name` of an extended header block) are skipped so parsing does
+  not pay to validate unused metadata.
 
-## Decompressing in a thread
+## Performance
 
-untar decompresses and extracts one after the other, in one thread, while `tar xzf` and
-`gzip -d | tar xf -` decompress in another process at the same time. In Python, a thread can do
-the same, since decompression and writes to a pipe release the GIL:
+`untar` reads the stream once from front to back without seeking, parses only the header fields
+required for extraction, and keeps a stack of open ancestor directory descriptors so typical
+depth-first archives rarely reopen parent directories.
+
+### Decompressing in a thread
+
+`untar` decompresses and extracts sequentially on the calling thread, whereas `tar xzf` and
+`gzip -d | tar xf -` overlap decompression and extraction across processes. You can overlap them in
+Python by running `gzip` in a background thread that writes to a pipe, as both `zlib` and pipe
+writes release the GIL:
 
 ```python
 import gzip
@@ -85,7 +102,7 @@ class Gunzip:
 
     def _decompress(self, path, w):
         try:
-            # Writes block while the pipe is full, so decompression stays at most a pipe
+            # Writes block while the pipe is full, keeping decompression at most one pipe
             # buffer ahead of extraction
             with open(w, "wb") as out, gzip.open(path) as f:
                 shutil.copyfileobj(f, out, 64 * 1024)
@@ -95,7 +112,7 @@ class Gunzip:
     def read(self, size):
         data = self.pipe.read(size)
         if not data:
-            # The end of the pipe: wait until the gzip checksum is verified
+            # End of pipe: wait for the thread so any gzip checksum error is raised
             self.thread.join()
             if self.error:
                 raise self.error
@@ -105,7 +122,7 @@ class Gunzip:
         return self
 
     def __exit__(self, *exc):
-        # If extraction stopped early, a blocked write then fails, and the thread ends
+        # If extraction aborts early, closing the read end unblocks the writer thread
         self.pipe.close()
         self.thread.join()
 
@@ -113,39 +130,6 @@ class Gunzip:
 with Gunzip("pkg.tar.gz") as stream:
     untar.extract(stream, "/opt/pkg")
 ```
-
-untar reads the stream to its end before it moves anything into the destination, so an archive
-with a bad gzip checksum leaves the destination untouched.
-
-## Safety
-
-Absolute names and `..` are rejected, dirs are opened with `O_NOFOLLOW` so nothing is written
-through a symlink, and files are created with `O_EXCL | O_NOFOLLOW` so existing entries are never
-replaced. Symlinks may point anywhere, but untar never follows them, except where the destination
-itself is one. The destination can also be an open dir file descriptor, so that a caller who
-opened it safely extracts into that very dir.
-
-On Windows, which has no dir file descriptors, entries are created by path. Every dir leading to
-the current member is held open without sharing delete access, so that neither it nor its
-ancestors can be renamed or removed, and none can be swapped for a symlink or junction while it is
-in use. Files are created with `CREATE_NEW` and `FILE_FLAG_OPEN_REPARSE_POINT`, the counterpart of
-`O_EXCL | O_NOFOLLOW`, and symlinks and junctions on the path to the destination are resolved
-once (from Python 3.8 on, whose `realpath` resolves them on Windows).
-
-Parsing is relatively strict: the idea is to reject tar files that would extract differently
-under tar implementations with more lenient parsing. Numbers must be plain digits with a
-terminator, a member's name and size come from one header only, global pax headers cannot set
-them, names and link targets must be UTF-8 without a NUL inside, names have no backslash or drive
-letter, and links, dirs, devices and fifos cannot have a size. The rules are those of the default
-policy of [tar-minefield](https://github.com/haampie/tar-minefield), as far as they are about what
-untar extracts. What it does not extract, it does not read: an owner or a timestamp that is not a
-number, the name of an extended header, and the mode of a hardlink are not looked at, although
-some implementations stop at such a header or make something else of it, so that no archive pays
-for checks of fields that are not used. The gzip checksum is always
-verified, and an archive may end after its last member or with two zero blocks, but only zeros may
-follow them, so that a second archive after the first does not go unnoticed. Without the two zero
-blocks, as in ruby's release tarballs, an uncompressed archive cut short between members cannot be
-told apart from a complete one; a compressed one fails to decompress.
 
 ## Development
 
@@ -156,12 +140,8 @@ $ UNTAR_CPYTHON_TESTDATA=cpython-testdata pytest
 $ ruff check && ruff format --diff && mypy
 ```
 
-`tests/tar-minefield` is the test suite of [tar-minefield](https://github.com/haampie/tar-minefield),
-whose verdicts `tests/test_minefield.py` checks, and whose language the tests use: cases with
-an identifier such as `F12`, in the categories framing (F), names (N), kinds (K), and order and
-state (S), to reject, accept or tolerate. The few cases where untar differs are listed there, each
-with its reason: `REJECTED`, tolerated cases that it rejects, and `ACCEPTED`, cases to reject that
-it accepts.
-
-`tests/vendor/test_cpython.py` is adapted from CPython's `test_tarfile.py` and is under the PSF
-License Agreement included in it. The rest of untar is under the MIT license.
+`tests/tar-minefield` vendors the [tar-minefield](https://github.com/haampie/tar-minefield) test
+suite; `tests/test_minefield.py` lists the few cases where `untar` intentionally differs (`ACCEPTED`
+for unused header fields that are not parsed, and `REJECTED` for tolerated cases that `untar`
+refuses). `tests/vendor/test_cpython.py` is adapted from CPython's `test_tarfile.py` under the PSF
+License Agreement; the rest of `untar` is under the MIT license.

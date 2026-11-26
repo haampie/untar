@@ -1,14 +1,8 @@
-"""The test suite of tar-minefield, in tar-minefield/: archives, each a case with a verdict.
+"""Run the vendored tar-minefield test suite against untar.
 
-untar is a strict parser. It must extract the tree in the manifest of every case to accept, and
-reject every case to reject, except those in ACCEPTED: untar does not read what it does not
-extract, such as owners, also where a strict parser would have to. A tolerated case it may
-reject or extract, and REJECTED lists those it rejects. A rejection leaves the destination
-empty, and no case writes outside of it.
-
-As in tar-minefield, an error that untar raises is a rejection, and so is one of the operating
-system that refuses an operation, such as creating a file that exists. Any other exception is a
-crash, and fails the test."""
+untar must extract the expected tree for every case with verdict "accept" and reject every case
+with verdict "reject" (leaving the destination empty and writing nothing outside it), except for
+the cases listed in ACCEPTED and REJECTED below."""
 
 import hashlib
 import json

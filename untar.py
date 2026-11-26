@@ -1,10 +1,9 @@
 """Fast, safe, streaming extraction of tar archives that distribute software.
 
-Archives are read front to back exactly once, from a file or any readable binary stream, and
-only the header fields that extraction needs are parsed. ``extract`` can strip a leading
-directory that is only known from the archive's contents: the parent of the shallowest member
-with a given name. Owners, groups, timestamps and permissions in the archive are not restored:
-files are created with the permissions given by the caller.
+Archives are read front to back in a single pass from a file path or any readable binary stream,
+parsing only the header fields required for extraction. Owners, groups, timestamps, and full mode
+bits from the archive are ignored; extracted files and directories receive caller-specified
+permissions.
 """
 
 import contextlib
@@ -20,7 +19,6 @@ if sys.platform == "win32":
     import _winapi
     import msvcrt
 
-    # Arguments of CreateFile, which _winapi does not all have
     _GENERIC_READ = 0x80000000
     _GENERIC_WRITE = 0x40000000
     _FILE_SHARE_READ_WRITE = 0x1 | 0x2
@@ -43,23 +41,21 @@ _PAX_HEADER = b"x"
 _PAX_GLOBAL_HEADER = b"g"
 _GNU_LONGNAME = b"L"
 _GNU_LONGLINK = b"K"
-#: Not the extended headers of Solaris (X), which other readers take for files
+# Solaris 'X' extended headers are omitted so they are rejected as an unsupported member type.
 _EXTENDED = (_PAX_HEADER, _PAX_GLOBAL_HEADER, _GNU_LONGNAME, _GNU_LONGLINK)
-#: Not contiguous files (7), which some readers read without data
+# Contiguous files ('7') are omitted because implementations disagree on whether they carry data.
 _DATA_TYPES = (REGTYPE, AREGTYPE)
-#: Dirs, devices and fifos. Like tarfile, members of other types than these and links have
-#: data, also unknown ones.
+# Directories, devices, and FIFOs never carry a data payload.
 _NO_DATA_TYPES = (DIRTYPE, b"3", b"4", b"6")
 
 _WINDOWS = sys.platform == "win32"
 _BLOCK = 512
 _EOF_BLOCK = bytes(_BLOCK)
-#: Sizes from this on do not fit in a ustar header, and are written in a pax header
+# Minimum file size (8 GiB) that does not fit in an 11-digit octal ustar size field.
 _PAX_SIZE = 8**11
 _CHUNK = 64 * 1024
 _BUF = 1024 * 1024
-#: Pax keys that only some readers apply, to what is extracted: the encoding of names, a mode
-#: (which is not a pax key), sparse files of star and Solaris, and ACLs stored as xattrs
+# Pax keys that alter file contents, encoding, or permissions in ways that only some readers apply.
 _REFUSED_KEYS = frozenset(
     (
         b"hdrcharset",
@@ -72,33 +68,29 @@ _REFUSED_KEYS = frozenset(
         b"LIBARCHIVE.xattr.system.posix_acl_default",
     )
 )
-#: And those of GNU's sparse files, and of ACLs
 _REFUSED_PREFIXES = (b"GNU.sparse.", b"SCHILY.acl.")
-#: Pax keys of a member, which a global header cannot set
+# Per-member pax keys that are ambiguous when placed in a global pax header.
 _MEMBER_KEYS = frozenset((b"path", b"linkpath", b"size"))
-#: Pax and GNU long name headers are read into memory: limit their size per member
 _MAX_EXTENDED = 1024 * 1024
-#: Digits of a pax number: enough for any size
+# Cap pax decimal lengths to avoid quadratic int() conversion on huge digit strings.
 _MAX_DIGITS = 32
-#: The magics of headers: POSIX, with its version 00 or NULs as some Java archivers write it,
-#: GNU, and none (v7)
+# POSIX ustar magic with version "00", or "\0\0" as emitted by some Java archivers.
 _POSIX_MAGICS = (b"ustar\x0000", b"ustar\0\0\0")
 _V7_MAGIC = bytes(8)
 _OTHER_MAGICS = (b"ustar  \0", _V7_MAGIC)
-#: Dirs on the stack that stay open: the deepest ones, and shallower ones are reopened if needed
 _MAX_OPEN_DIRS = 64
-#: Path components per member: on macOS, creating an entry takes time linear in its depth
+# Limit directory nesting depth; deep paths degrade to quadratic creation time on macOS.
 _MAX_DEPTH = 1024
 _DRIVES = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _BadGzipFile = getattr(gzip, "BadGzipFile", OSError)
 
 
 class Error(ValueError):
-    """The archive is invalid, or cannot be extracted safely."""
+    """The archive is invalid or cannot be extracted safely."""
 
 
 class Member:
-    """A member of a tar archive, with only the fields that extraction needs."""
+    """A tar archive member containing only the fields needed for extraction."""
 
     __slots__ = ("linkname", "mode", "name", "size", "type")
 
@@ -128,7 +120,7 @@ class Member:
 
 
 def _int(field: bytes, terminated: bool = True) -> int:
-    """A size: octal, or base-256 (GNU)."""
+    """Parse a size field encoded in octal or positive GNU base-256."""
     if field[0] == 0o200:
         return int.from_bytes(field[1:], "big")
     elif field[0] == 0o377:
@@ -137,8 +129,7 @@ def _int(field: bytes, terminated: bool = True) -> int:
 
 
 def _octal(field: bytes, terminated: bool = True) -> int:
-    """Octal digits, after spaces and before spaces or NULs: a terminator, without which
-    readers take the last byte of a field for a digit or not."""
+    """Parse an octal field with optional leading spaces and trailing spaces or NULs."""
     digits = field.rstrip(b" \0")
     if not terminated or len(digits) < len(field):
         if digits.isdigit():
@@ -147,8 +138,6 @@ def _octal(field: bytes, terminated: bool = True) -> int:
             except ValueError:
                 pass
         else:
-            # Readers disagree on other padding: some skip a leading NUL or other
-            # whitespace, others stop there, and some read digits after a NUL.
             digits = digits.lstrip(b" ")
             if not digits.strip(b"01234567"):
                 return int(digits, 8) if digits else 0
@@ -156,8 +145,6 @@ def _octal(field: bytes, terminated: bool = True) -> int:
 
 
 def _name(raw: bytes) -> str:
-    """A name or link target, which must be UTF-8: readers create other names as they are, or
-    replace their bytes."""
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -165,8 +152,7 @@ def _name(raw: bytes) -> str:
 
 
 def _long_name(data: bytes) -> str:
-    """A GNU long name or link, which ends with NULs. Readers disagree on a NUL inside it: some
-    stop there, others keep the rest; and without a NUL, on where it ends."""
+    """Parse a NUL-terminated GNU long name or link target without embedded NULs."""
     name = data.rstrip(b"\0")
     if not name:
         raise Error("Archive contains an empty GNU long name")
@@ -180,21 +166,17 @@ def _long_name(data: bytes) -> str:
 
 
 def _pax_name(key: str, value: bytes) -> str:
-    """A pax path or linkpath."""
-    # An empty one removes the name in POSIX, and readers stop at a NUL or keep the rest
+    """Parse a pax path or linkpath, rejecting empty values, NULs, and newlines."""
     if not value or 0 in value:
         raise Error(f"Archive contains an invalid pax {key} {value!r}")
-    # Records are delimited by their length, but some readers split them on newlines, and
-    # see other records. In what no reader uses, such as a comment, POSIX allows them.
+    # Line-based pax parsers split records on newlines even when the record length spans past them.
     if 0x0A in value:
         raise Error(f"Archive contains a newline in the pax {key}")
     return _name(value)
 
 
 def _pax_size(value: bytes) -> int:
-    """A pax size: a decimal number of ASCII digits only, without leading zeros."""
-    # int() of thousands of digits is slow, and fails from Python 3.11 on. Some readers take
-    # a leading zero for octal.
+    """Parse a pax size: ASCII decimal digits without leading zeros."""
     if (
         not value
         or value.strip(b"0123456789")
@@ -206,41 +188,31 @@ def _pax_size(value: bytes) -> int:
 
 
 def _checksum_ok(header: bytes) -> bool:
-    # Octal only: tar and libarchive refuse a base-256 checksum, and look for the next
-    # header in what follows. Many archives have one of eight digits, without a terminator.
+    # Some writers emit an 8-digit octal checksum without a trailing NUL or space.
     field = header[148:156]
     expected = _octal(field, False)
-    # adler32's low half is the byte sum mod 65521, which is exact for 256 bytes
+    # The low 16 bits of adler32 compute the exact unsigned byte sum mod 65521 (safe for <= 256 B).
     total = (zlib.adler32(header[:256], 0) & 0xFFFF) + (
         zlib.adler32(header[256:], 0) & 0xFFFF
     )
-    # Not the signed sum, which some old tar implementations wrote: others refuse it, and some
-    # look for the next header in what follows
     return expected == total - sum(field) + 256
 
 
 def _pax_records(data: bytes) -> Dict[bytes, bytes]:
-    """Parse the ``<length> <key>=<value>\\n`` records of a pax extended header. Values are
-    not decoded: few are used."""
+    """Parse ``<length> <key>=<value>\\n`` records from a pax extended header."""
     records: Dict[bytes, bytes] = {}
     pos = 0
-    # The records fill the header: readers disagree on what follows a NUL in between
     while pos < len(data):
-        # A length of at most _MAX_DIGITS digits, since int() of more fails from Python 3.11
         space = data.find(b" ", pos, pos + _MAX_DIGITS + 1)
         length = data[pos:space]
-        # Without leading zeros: some readers find the end of a record from the length as
-        # written
         if space < 0 or not length.isdigit() or length[0] == 0x30:
             raise Error("Archive contains an invalid pax header")
         end = pos + int(length)
         if end <= space or end > len(data) or data[end - 1] != 0x0A:
             raise Error("Archive contains an invalid pax header")
         key, equals, value = data[space + 1 : end - 1].partition(b"=")
-        # GNU tar skips blanks before a key, and readers stop at a NUL in it or skip it
         if not key or not equals or key[0] in b" \t" or 0 in key:
             raise Error("Archive contains an invalid pax record")
-        # Readers take the first or the last of them
         if key in records:
             raise Error(f"Archive contains the pax {key!r} twice in one header")
         if key in _REFUSED_KEYS or key.startswith(_REFUSED_PREFIXES):
@@ -251,7 +223,7 @@ def _pax_records(data: bytes) -> Dict[bytes, bytes]:
 
 
 def _fill(stream: IO[bytes], size: int) -> bytes:
-    """Read size bytes, or fewer at the end of the stream."""
+    """Read up to size bytes from stream, looping across short reads until EOF."""
     data = stream.read(size)
     while 0 < len(data) < size:
         more = stream.read(size - len(data))
@@ -262,24 +234,22 @@ def _fill(stream: IO[bytes], size: int) -> bytes:
 
 
 class TarReader:
-    """Reads the members of a tar archive front to back from a binary stream, without seeking.
+    """Single-pass streaming reader for ustar, pax, and GNU tar archives.
 
-    Parses ustar headers, pax extended headers and GNU long names, and verifies header
-    checksums, the end-of-archive marker if there is one, and that only zeros follow it, up to
-    the end of the stream. Iterate for members, and read the data of the current regular file with
-    ``chunks()``; data that is not read is skipped."""
+    Iterating over a ``TarReader`` yields ``Member`` objects. Call ``chunks()`` to read the
+    payload of the current regular file; any unread payload is skipped automatically when
+    advancing to the next member.
+    """
 
     def __init__(self, stream: IO[bytes]) -> None:
         self.stream = stream
-        #: Unread data of the current member
         self.remaining = 0
         self.buf = b""
         self.pos = 0
 
     def _more(self, size: int) -> None:
-        """Make sure size bytes are buffered, or fewer at the end of the stream."""
+        """Buffer at least size bytes (or until EOF)."""
         rest = self.buf[self.pos :]
-        # Not joined with an empty rest, which would copy what is read
         parts = [rest] if rest else []
         have = len(rest)
         while have < size:
@@ -313,8 +283,7 @@ class TarReader:
             size -= len(more)
 
     def _end(self) -> None:
-        """Read the rest of the stream, after the end-of-archive marker. Writers pad it with
-        zeros, and anything else, like a second archive, would be ignored by every reader."""
+        """Verify that only zero padding follows the end-of-archive marker."""
         rest = self.buf[self.pos :]
         self.buf, self.pos = b"", 0
         while not rest.strip(b"\0"):
@@ -324,15 +293,13 @@ class TarReader:
         raise Error("Archive contains data after the end-of-archive marker")
 
     def _header(self) -> Optional[bytes]:
-        """The next header, or None at the end-of-archive marker or at the end of the stream."""
+        """Read the next header block, or return None at the end of the archive."""
         if self.pos == len(self.buf):
             self._more(_BLOCK)
             if not self.buf:
-                # No end-of-archive marker, as in ruby's release tarballs
                 return None
         header = self._read(_BLOCK)
         if header == _EOF_BLOCK:
-            # The marker is two zero blocks. tar and tarfile stop at one, and skip what follows.
             if self._read(_BLOCK) != _EOF_BLOCK:
                 raise Error("Archive contains a lone zero block")
             return None
@@ -341,7 +308,7 @@ class TarReader:
         return header
 
     def chunks(self, size: int = _CHUNK) -> Iterator[memoryview]:
-        """Yield the unread data of the current member, as views that stay valid."""
+        """Yield unread data from the current member in chunks of up to size bytes."""
         while self.remaining:
             if self.pos >= len(self.buf):
                 self._more(1)
@@ -357,16 +324,16 @@ class TarReader:
         self._more(_BLOCK)
         if not self.buf:
             raise Error("Archive is empty")
-        # Readers that decide what an archive is from its first header do not know pax headers
-        # after a v7 header, which has no magic, and take them for files
+        # Readers that classify the archive format from the first header treat later pax headers
+        # as regular files if the first header is v7 (empty magic).
         v7 = self.buf[257:265] == _V7_MAGIC
         padding = 0
         while True:
             self._skip(self.remaining + padding)
             self.remaining = 0
 
-            # Extended headers apply to the next member, and may give its name in one way only,
-            # so that readers that resolve conflicts differently cannot see different members.
+            # Allow at most one extended header source per member so conflicting overrides cannot
+            # produce different trees across implementations.
             name: Optional[str] = None
             linkname: Optional[str] = None
             pax_size: Optional[int] = None
@@ -389,14 +356,10 @@ class TarReader:
                 data = self._read(size)
                 self._read(-size % _BLOCK)
                 if type == _GNU_LONGNAME or type == _GNU_LONGLINK:
-                    # Not bytes in bytes, which is slow
                     if type[0] in seen:
                         raise Error(
                             f"Archive contains two {type!r} headers for one member"
                         )
-                    # Each extends the next header, and does not know the other: a GNU long
-                    # name before a pax header can apply to the pax header, and a pax size
-                    # to a GNU long name.
                     if _PAX_HEADER[0] in seen:
                         raise Error(
                             "Archive contains both a pax header and a GNU long name for "
@@ -414,13 +377,10 @@ class TarReader:
                     )
                 pax = _pax_records(data)
                 if type == _PAX_GLOBAL_HEADER:
-                    # An extended header before it applies to it for some readers, and to
-                    # the member for others
                     if seen:
                         raise Error(
                             "Archive contains a global pax header after an extended header"
                         )
-                    # Readers disagree on whether these apply to later members: refuse them.
                     if not _MEMBER_KEYS.isdisjoint(pax):
                         raise Error(
                             "Archive contains a global pax path, linkpath or size"
@@ -441,39 +401,34 @@ class TarReader:
                 if b"size" in pax:
                     pax_size = _pax_size(pax[b"size"])
 
-            # A name ends at its first NUL
             nul = header.find(b"\0", 0, 100)
             raw_name = header[:nul] if nul >= 0 else header[:100]
-            # Like GNU tar and libarchive, ustar headers have a name prefix, whatever their
-            # version. Other headers have times there (GNU incremental), which some readers
-            # take for a prefix.
+            # Only ustar headers carry a path prefix at offset 345; GNU incremental headers store
+            # timestamps there.
             magic = header[257:265]
             if magic in _POSIX_MAGICS:
-                # star's prefix is 131 bytes, followed by times, for some readers
+                # star's xstar format splits offset 345..500 into a 131-byte prefix and timestamps.
                 if header[508:512] == b"tar\0" and 0 not in header[345:476]:
                     raise Error("Archive contains a star header with a long prefix")
                 if header[345]:
                     raw_name = header[345:500].split(b"\0", 1)[0] + b"/" + raw_name
             elif magic not in _OTHER_MAGICS:
-                # A damaged magic, or a version that readers take for ustar or not
                 raise Error(f"Archive contains a header with the magic {magic!r}")
             elif header[345]:
                 raise Error(
                     "Archive contains a name prefix in a header that is not ustar"
                 )
             if name is None:
-                # Some readers keep what follows the NUL
                 if nul >= 0 and header.count(b"\0", nul, 100) != 100 - nul:
                     raise Error(
                         f"Archive contains bytes after the NUL of the name {header[:100]!r}"
                     )
                 name = _name(raw_name)
-            # A separator on Windows, and a character elsewhere
             if "\\" in name:
                 raise Error(f"Archive contains a backslash in the name {name}")
             if type == AREGTYPE and name.endswith("/"):
-                # Old tar implementations write dirs as files named with a slash, in the
-                # header, where an extended header gives a file its name
+                # V7 archives represent directories as type '\0' with a trailing slash in the ustar
+                # name field; reject if the trailing slash came only from an extended header.
                 if not raw_name.endswith(b"/"):
                     raise Error(
                         f"Archive contains {name}, named like a directory by its extended "
@@ -481,14 +436,12 @@ class TarReader:
                     )
                 type = DIRTYPE
 
-            # Octal: a mode fits, and not every reader of base-256 sizes reads one in base-256
             mode = _octal(header[100:108])
             if pax_size is None:
                 size = _int(header[124:136])
             else:
-                # Readers without pax support use the ustar size. Writers only use a pax
-                # size that is too large for it, and then write 0 there or the same size:
-                # bsdtar in twelve digits, without a terminator.
+                # A pax size must match the ustar size unless the file is >= 8 GiB, where writers
+                # place either 0 or an unterminated 12-digit octal value (bsdtar) in the header.
                 size = _int(header[124:136], False)
                 if pax_size != size and (size or pax_size < _PAX_SIZE):
                     raise Error(
@@ -497,26 +450,21 @@ class TarReader:
                 size = pax_size
 
             if type in _DATA_TYPES:
-                # A link target of a file is not read: readers make a file of it
                 linkname = ""
                 self.remaining = size
             elif type == SYMTYPE or type == LNKTYPE:
                 if linkname is None:
                     raw = header[157:257].rstrip(b"\0")
-                    # As in a name, some readers keep what follows a NUL
                     if 0 in raw:
                         raise Error(
                             f"Archive contains bytes after the NUL of the link target {raw!r}"
                         )
                     linkname = _name(raw)
-                # Readers disagree on whether data follows: tar and tarfile take the size of
-                # a link for data.
                 if size:
                     raise Error(
                         f"Archive contains {name} of type {type!r} with size {size}"
                     )
             else:
-                # Readers that look at the link target rather than the type make a link of it
                 if linkname is not None or header[157]:
                     raise Error(
                         f"Archive contains {name} of type {type!r} with a link target"
@@ -531,7 +479,6 @@ class TarReader:
                         )
                     self.remaining = size
                 elif size:
-                    # tar and tarfile skip the size of a dir
                     raise Error(
                         f"Archive contains {name} of type {type!r} with size {size}"
                     )
@@ -540,7 +487,7 @@ class TarReader:
 
 
 class _Prepend:
-    """A stream that first returns ``head`` and then reads from ``stream``."""
+    """A stream wrapper that yields ``head`` before reading from ``stream``."""
 
     def __init__(self, head: bytes, stream: IO[bytes]) -> None:
         self.head = head
@@ -556,7 +503,7 @@ class _Prepend:
 
 
 class _Gzip:
-    """A gzip stream whose errors are untar errors."""
+    """A gzip stream wrapper that translates decompression errors into ``untar.Error``."""
 
     def __init__(self, stream: _Prepend) -> None:
         self.gzip = gzip.GzipFile(fileobj=stream, mode="rb")  # type: ignore[call-overload]
@@ -574,8 +521,7 @@ class _Gzip:
 def _open_archive(
     src: Union[str, "os.PathLike[str]", IO[bytes]],
 ) -> Iterator[IO[bytes]]:
-    """Open a path or a binary file object as a stream of uncompressed tar data, which is
-    detected from the first bytes. Use as a context manager; file objects are not closed."""
+    """Open a file path or binary stream, transparently decompressing gzip if detected."""
     file = open(src, "rb") if isinstance(src, (str, os.PathLike)) else None  # noqa: SIM115
     try:
         stream = file or src
@@ -588,7 +534,7 @@ def _open_archive(
 
 
 def _common(a: List[str], b: List[str]) -> int:
-    """The number of leading names a and b have in common."""
+    """Return the number of leading elements shared by ``a`` and ``b``."""
     n = 0
     for x, y in zip(a, b):
         if x != y:
@@ -598,12 +544,11 @@ def _common(a: List[str], b: List[str]) -> int:
 
 
 def _parts(name: str) -> List[str]:
-    """Split a member name into path components, rejecting names that escape the destination."""
+    """Split a member name into normalized path components, rejecting unsafe or overly deep paths."""
     parts = [p for p in name.split("/") if p and p != "."]
     if (
         name.startswith("/")
         or ".." in parts
-        # A drive letter, which makes a name absolute on Windows, and is a name elsewhere
         or name[1:2] == ":"
         and name[0] in _DRIVES
         or _WINDOWS
@@ -616,7 +561,7 @@ def _parts(name: str) -> List[str]:
 
 
 def _resolve(parts: List[str], linkname: str) -> Optional[List[str]]:
-    """The member a relative symlink at parts points to, or None if it points outside."""
+    """Resolve a relative symlink target from ``parts``, or return None if it escapes the root."""
     if linkname.startswith("/"):
         return None
     target = parts[:-1]
@@ -630,10 +575,7 @@ def _resolve(parts: List[str], linkname: str) -> Optional[List[str]]:
     return target
 
 
-#: Whether entries are created relative to open dir file descriptors. Otherwise, as on Windows,
-#: they are created by (extended-length) path.
 _DIR_FD = all(
-    # By name, since Windows has no os.chown
     getattr(os, name, None) in os.supports_dir_fd
     for name in (
         "open",
@@ -652,19 +594,17 @@ _DIR_FD = all(
 )
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_BINARY = getattr(os, "O_BINARY", 0)
-# os.open makes file descriptors non-inheritable, so O_CLOEXEC is implied
-#: The caller chooses dest, so it may be a symlink, unlike the dirs in the archive
 _DEST_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
 _DIR_FLAGS = _DEST_FLAGS | _O_NOFOLLOW
 _FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_BINARY
 
 
 def _create(path: str, dir_fd: Optional[int], mode: int) -> int:
-    """Create a file and open it for writing, where nothing is, not even a symlink."""
+    """Exclusively create and open a new file without following symlinks."""
     if sys.platform == "win32":
-        # os.open has no O_NOFOLLOW there, and its O_EXCL creates the target of a symlink to
-        # nothing. CreateFile does not follow a symlink with FILE_FLAG_OPEN_REPARSE_POINT,
-        # and with CREATE_NEW fails on it as on any entry.
+        # On Windows, os.open with O_CREAT | O_EXCL follows a dangling symlink and creates its
+        # target; CreateFile with CREATE_NEW | FILE_FLAG_OPEN_REPARSE_POINT fails on any existing
+        # reparse point.
         flags = _FILE_FLAG_OPEN_REPARSE_POINT | (
             _FILE_ATTRIBUTE_NORMAL if mode & stat.S_IWRITE else _FILE_ATTRIBUTE_READONLY
         )
@@ -680,24 +620,23 @@ def _create(path: str, dir_fd: Optional[int], mode: int) -> int:
 
 
 class _Pinned(str):
-    """The path of a dir, with a handle that does not share delete access, so that the dir
-    cannot be renamed or removed while it is open: on Windows, which has no dir file
-    descriptors, nothing on a path of such dirs can be swapped for a symlink or junction."""
+    """A directory path on Windows paired with an open handle that omits FILE_SHARE_DELETE,
+    preventing the directory and its ancestors from being renamed, deleted, or replaced with a
+    junction or symlink while open."""
 
     handle: int
 
 
-#: SetFileTime of kernel32, on Windows: loaded on first use, as importing ctypes takes ms
 _SetFileTime: Any = None
 
 
 def _set_mtime(fd: int, mtime: float) -> None:
-    """Set the access and modification times of an open file."""
+    """Set the access and modification times of an open file descriptor."""
     if sys.platform != "win32":
         os.utime(fd, (mtime, mtime))
     else:
-        # os.utime takes no file descriptor on Windows, but SetFileTime takes its handle,
-        # with times in 100 ns since 1601
+        # Windows os.utime does not accept file descriptors; call SetFileTime on the OS handle
+        # (in 100 ns intervals since 1601-01-01).
         import ctypes
 
         global _SetFileTime
@@ -710,20 +649,18 @@ def _set_mtime(fd: int, mtime: float) -> None:
             raise ctypes.WinError(ctypes.get_last_error())
 
 
-#: An open dir: a file descriptor, or a path where dir file descriptors are not supported,
-#: pinned on Windows
+#: An open directory: an integer file descriptor on POSIX, or a path string (pinned on Windows).
 Dir = Union[int, str]
 
 
 def _at(parent: Dir, name: str) -> Tuple[str, Optional[int]]:
-    """The path and dir_fd arguments for name in parent."""
     if isinstance(parent, int):
         return name, parent
     return os.path.join(parent, name), None
 
 
 def _open_dir(parent: Dir, name: str) -> Dir:
-    """Open the dir name in parent, without following symlinks."""
+    """Open child directory ``name`` inside ``parent`` without following symlinks or junctions."""
     if isinstance(parent, int):
         try:
             return os.open(name, _DIR_FLAGS, dir_fd=parent)
@@ -746,7 +683,7 @@ def _open_dir(parent: Dir, name: str) -> Dir:
             _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
             0,
         )
-    # Once pinned, what is at path stays: a junction is a dir to lstat, but a reparse point
+    # Verify after pinning that the entry is a real directory and not a reparse point (junction).
     try:
         s = os.lstat(path)
         if not stat.S_ISDIR(s.st_mode) or getattr(s, "st_file_attributes", 0) & (
@@ -760,7 +697,6 @@ def _open_dir(parent: Dir, name: str) -> Dir:
 
 
 def _lstat(parent: Dir, name: str) -> Optional[os.stat_result]:
-    """Stat name in parent without following symlinks, or None if it does not exist."""
     path, dir_fd = _at(parent, name)
     try:
         return os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
@@ -776,7 +712,6 @@ def _close(d: Dir) -> None:
 
 
 def _rmdir(parent: Dir, name: str) -> bool:
-    """Remove the dir name in parent if it is empty, and return whether it was removed."""
     path, dir_fd = _at(parent, name)
     try:
         os.rmdir(path, dir_fd=dir_fd)
@@ -786,7 +721,7 @@ def _rmdir(parent: Dir, name: str) -> bool:
 
 
 def _remove_files(d: Dir) -> List[str]:
-    """Remove the entries of d that are not dirs, as far as possible, and return its subdirs."""
+    """Unlink all non-directory entries in ``d`` and return the names of its subdirectories."""
     subdirs = []
     for name in os.listdir(d):
         path, dir_fd = _at(d, name)
@@ -799,7 +734,6 @@ def _remove_files(d: Dir) -> List[str]:
     return subdirs
 
 
-#: Errors of creating a link where the platform or filesystem does not support it
 _UNSUPPORTED = {
     errno.EPERM,
     errno.ENOSYS,
@@ -809,25 +743,18 @@ _UNSUPPORTED = {
 
 
 def _unsupported(e: OSError) -> bool:
-    """Whether a link could not be created because links are not supported."""
-    # Windows requires a privilege for symlinks, and some filesystems have no hardlinks
+    """Return True if ``e`` indicates that the platform or filesystem does not support links."""
     return e.errno in _UNSUPPORTED or _WINDOWS and not isinstance(e, FileExistsError)
 
 
 class _Extractor:
-    """Extracts members in a single pass, each to its full archive name in a temporary dir.
+    """Extracts archive members into a temporary directory inside ``dest`` and moves the final
+    root into place upon completion.
 
-    Where supported, entries are created relative to open dir file descriptors, so paths are
-    never longer than a single name, and nothing is written through a symlink, even one swapped
-    in concurrently. The open dirs are a stack of the ancestors of the current member, which for
-    the depth-first order of tar archives changes little from one member to the next. Only the
-    deepest ``_MAX_OPEN_DIRS`` of them stay open, so that deep archives do not run out of file
-    descriptors; closed ones are opened again from tmp when needed.
-
-    The archive name of the final root is only known after the last member. Validation only
-    needs ``root``, the deepest dir containing every member that is not a dir leading up to
-    it. State is bounded by the depth of the archive, apart from links that could not be
-    created."""
+    Maintains a stack of open ancestor directories for the current member. On POSIX, at most the
+    deepest ``_MAX_OPEN_DIRS`` descriptors are kept open at once to bound file descriptor usage;
+    on Windows, every ancestor on the current path stays open so the entire chain remains pinned.
+    """
 
     def __init__(
         self,
@@ -845,29 +772,21 @@ class _Extractor:
         self.root: List[str] = []
         self.descending = True
         self.marker_name = root_marker
-        #: The shallowest member with the marker name
         self.marker: Optional[List[str]] = None
-        #: Symlinks that could not be created, to their targets: copied once extracted. They
-        #: are in copies too.
+        # Deferred symlink copies (link path -> target path) when the OS does not support symlinks.
         self.links: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
-        #: Symlinks that are copied, or are to be: nothing else is extracted at or below them,
-        #: as nothing would be at or below a symlink
+        # Paths of copied symlinks; no subsequent member may be extracted at or beneath them.
         self.copies: Set[Tuple[str, ...]] = set()
-        #: The names of the dirs below tmp that lead to the current member
         self.names: List[str] = []
-        #: The deepest of those dirs, at most _MAX_OPEN_DIRS, which are open
         self.dirs: List[Dir] = []
 
         if isinstance(dest, int):
-            # A copy, so that the caller's file descriptor stays open
             self.dest: Dir = os.dup(dest)
         else:
             os.makedirs(dest, exist_ok=True)
-            # By path, every call resolves symlinks and junctions on it, which could be
-            # swapped: resolve them once
+            # Resolve symlinks and junctions on the destination path once up front.
             dest = os.path.realpath(dest) if _WINDOWS else os.path.abspath(dest)
             if _WINDOWS and not dest.startswith("\\\\?\\"):
-                # an extended-length path, which may exceed MAX_PATH
                 dest = "\\\\?\\" + dest
             self.dest = os.open(dest, _DEST_FLAGS) if _DIR_FD else dest
         while True:
@@ -881,16 +800,16 @@ class _Extractor:
         self.tmp_name = tmp_name
         self.tmp = _open_dir(self.dest, tmp_name)
         if _WINDOWS:
-            # Pinning tmp keeps its ancestors in place, which are dirs if the path still
-            # resolves to itself, rather than through a symlink or junction swapped in
+            # Verify that no ancestor of dest was swapped for a junction or symlink before tmp was
+            # pinned.
             path, _ = _at(self.dest, tmp_name)
             if os.path.normcase(os.path.realpath(path)) != os.path.normcase(path):
                 _close(self.tmp)
                 _rmdir(self.dest, tmp_name)
                 raise Error(f"Destination {dest} changed while it was opened")
 
-        # Find out once what the filesystem does to new entries: mode bits the umask or default
-        # ACLs strip, special bits it does not set, and the group they get.
+        # Probe the destination filesystem once to see whether umask, default ACLs, or setgid
+        # inheritance require explicit fchmod/fchown calls after file and directory creation.
         path, dir_fd = _at(self.tmp, "probe")
         os.close(_create(path, dir_fd, file_mode))
         s = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
@@ -903,9 +822,7 @@ class _Extractor:
         self.chmod_dirs = not _WINDOWS and stat.S_IMODE(s.st_mode) != dir_mode
 
     def close(self) -> None:
-        """Remove tmp, as far as possible, and close the open dirs."""
-        # After finish, the stack holds the now empty dirs leading up to the root: remove the open
-        # ones bottom up, without listing them.
+        """Close all open directory handles and remove the temporary extraction directory."""
         while self.dirs:
             _close(self.dirs.pop())
             name = self.names.pop()
@@ -914,7 +831,6 @@ class _Extractor:
                 break
         for d in self.dirs:
             _close(d)
-        # A pinned dir cannot be removed: tmp is emptied, and closed before it is removed
         with contextlib.suppress(OSError):
             if os.listdir(self.tmp):
                 self._remove_tmp()
@@ -923,9 +839,8 @@ class _Extractor:
         _close(self.dest)
 
     def _remove_tmp(self) -> None:
-        """Remove what is in tmp, as far as possible. The subdirs of a dir are moved into tmp
-        before it is removed, so that every dir is opened from tmp: without following symlinks,
-        one at a time, and in time linear in the number of entries, whatever their depth."""
+        """Empty ``self.tmp`` in O(N) time and with a single active directory descriptor by moving
+        nested subdirectories directly into ``self.tmp`` before removing their parents."""
         todo = _remove_files(self.tmp)
         taken = set(todo)
         i = 0
@@ -949,10 +864,7 @@ class _Extractor:
                 _rmdir(self.tmp, name)
 
     def _attrs(self, d: Dir, mode: int, chmod: bool) -> None:
-        """Set the group and mode of an open file or dir, which never follows a symlink."""
         if isinstance(d, str):
-            # A dir by path, where dir file descriptors are not supported, but it may still be
-            # opened without following a symlink
             if self.chown or chmod:
                 fd = os.open(d, _DIR_FLAGS)
                 try:
@@ -960,16 +872,15 @@ class _Extractor:
                 finally:
                     os.close(fd)
             return
-        # chown before chmod, since chown may clear set-user-ID and set-group-ID bits
+        # Call fchown before fchmod because chown can clear setuid/setgid bits.
         if self.chown:
             os.fchown(d, -1, self.gid)  # type: ignore
         if chmod:
             os.fchmod(d, mode)  # type: ignore
 
     def _dir(self, parts: List[str]) -> Dir:
-        """Open tmp/parts, creating missing dirs, and keep its deepest ancestors open."""
+        """Navigate to ``tmp/parts``, creating any missing directories along the way."""
         n, parent = self._open_ancestor(_common(self.names, parts))
-        # The open dirs above depth n stay
         keep = max(n - len(self.names) + len(self.dirs), 0)
         for d in self.dirs[keep:]:
             _close(d)
@@ -984,7 +895,6 @@ class _Extractor:
         return parent
 
     def _mkdir(self, parent: Dir, name: str) -> Dir:
-        """Create the dir name in parent, and open it."""
         path, dir_fd = _at(parent, name)
         os.mkdir(path, self.dir_mode, dir_fd=dir_fd)
         d = _open_dir(parent, name)
@@ -992,16 +902,13 @@ class _Extractor:
         return d
 
     def _push(self, name: str, d: Dir) -> None:
-        """Put an open dir on the stack, and close the one that is no longer among the deepest.
-        By path, every dir on the stack stays open, so that none on the path can be swapped."""
         self.names.append(name)
         self.dirs.append(d)
         if _DIR_FD and len(self.dirs) > _MAX_OPEN_DIRS:
             _close(self.dirs.pop(0))
 
     def _open_ancestor(self, n: int) -> Tuple[int, Dir]:
-        """The dir tmp/names[:n] and n if it is open, and otherwise tmp and 0: since only the
-        deepest dirs are open, none of its ancestors is then."""
+        """Return ``(n, dir)`` if ancestor depth ``n`` is still open on the stack, else ``(0, tmp)``."""
         closed = len(self.names) - len(self.dirs)
         if n > closed:
             return n, self.dirs[n - closed - 1]
@@ -1028,7 +935,7 @@ class _Extractor:
             os.close(fd)
 
     def _track(self, member: Member, parts: List[str]) -> None:
-        """Update root, which validation needs, and marker."""
+        """Track the shallowest ``root_marker`` match and the common ancestor directory ``root``."""
         if parts[-1:] == [self.marker_name] and (
             self.marker is None or len(parts) < len(self.marker)
         ):
@@ -1043,7 +950,6 @@ class _Extractor:
             self.root = self.root[:common]
             self.descending = False
         elif self.descending:
-            # Nothing but dirs so far: descend to the deepest dir containing this member.
             self.root = parts if member.isdir() else parts[:-1]
             self.descending = member.isdir()
 
@@ -1071,9 +977,7 @@ class _Extractor:
             except FileExistsError:
                 self._dir(parts)
         elif member.isreg():
-            # Like chmod +X: only executable if the member is executable by its owner
             mode = self.file_mode if member.mode & 0o100 else self.file_mode & ~0o111
-            # Each write as large as what is buffered
             self._file(parent, parts[-1], mode, reader.chunks(_BUF))
         elif member.issym():
             if not member.linkname:
@@ -1083,8 +987,7 @@ class _Extractor:
             except OSError as e:
                 if not _unsupported(e):
                     raise
-                # Like tarfile, copy the target instead where symlinks are not supported, and
-                # rather than drop a symlink, refuse one that cannot be copied.
+                # Fall back to copying internal symlink targets when symlinks are unavailable.
                 target = _resolve(parts, member.linkname)
                 if target is None:
                     raise Error(
@@ -1099,15 +1002,11 @@ class _Extractor:
             if self.chown:
                 os.chown(path, -1, self.gid, dir_fd=dir_fd, follow_symlinks=False)  # type: ignore
         elif member.islnk():
-            # A name that ends in a slash is that of a dir only, which a hardlink cannot be
-            # to: readers drop the slash, or find no such member
             if member.linkname.endswith(("/", "/.")):
                 raise Error(
                     f"Archive hardlinks {member.linkname}, named like a directory"
                 )
             source = _parts(member.linkname)
-            # tar archives an entry listed twice as a hardlink to itself, which readers
-            # replace, empty, or leave alone
             if source == parts:
                 raise Error(f"Archive hardlinks {member.name} to itself")
             if not self._copy(source, parts, link=True):
@@ -1120,9 +1019,7 @@ class _Extractor:
             )
 
     def _open_existing(self, parts: List[str]) -> Tuple[Dir, List[Dir]]:
-        """Open tmp/parts without creating anything, from the deepest dir on the stack that
-        contains it. Returns the dir and the dirs opened here, which must be closed: by path,
-        all of them stay open, so that none on the path can be swapped."""
+        """Open existing directory ``tmp/parts`` from the deepest open ancestor on the stack."""
         common, d = self._open_ancestor(_common(self.names, parts))
         opened: List[Dir] = []
         try:
@@ -1138,13 +1035,13 @@ class _Extractor:
         return d, opened
 
     def _copy(self, source: List[str], dest: List[str], link: bool = False) -> bool:
-        """Hardlink or copy an extracted entry to dest, and return whether it was extracted."""
+        """Hardlink or copy an already-extracted entry ``source`` to ``dest``."""
         if not source:
             return False
         if link and tuple(source) in self.copies:
-            # A copy of a symlink, which is a link to the symlink or to its target
             raise Error(f"Archive hardlinks {'/'.join(source)}, which is a symlink")
-        # Open dest's parent first, since that may close dirs on the stack that source reuses.
+        # Open dest's parent first because navigating the stack may close descriptors that source
+        # would otherwise reuse.
         parent = self._dir(dest[:-1])
         try:
             source_parent, opened = self._open_existing(source[:-1])
@@ -1155,7 +1052,6 @@ class _Extractor:
             if s is None:
                 return False
             if link and stat.S_ISLNK(s.st_mode):
-                # A link to the symlink, or to its target: link() may follow it
                 raise Error(f"Archive hardlinks {'/'.join(source)}, which is a symlink")
             path, dir_fd = _at(source_parent, source[-1])
             if stat.S_ISDIR(s.st_mode):
@@ -1179,7 +1075,6 @@ class _Extractor:
                 except OSError as e:
                     if not _unsupported(e):
                         raise
-                    # Like tarfile, copy where hardlinks are not supported
             if not stat.S_ISREG(s.st_mode):
                 return False
             src = os.open(path, os.O_RDONLY | _O_BINARY, dir_fd=dir_fd)
@@ -1194,7 +1089,8 @@ class _Extractor:
                 _close(d)
 
     def finish(self) -> str:
-        """Move the contents of the final root into dest, and return its archive name."""
+        """Resolve any deferred symlink copies, move the extracted root into ``dest``, and return
+        its archive path."""
         root: List[str] = []
         if self.marker_name is not None:
             if self.marker is None:
@@ -1203,7 +1099,7 @@ class _Extractor:
         if self.root[: len(root)] != root:
             raise Error(f"Archive contains members outside of {'/'.join(root) or '.'}")
 
-        # Copy a link to a link after that one, in time linear in the number of links
+        # Resolve deferred symlink chains in topological order.
         while self.links:
             chain = [self.links.popitem()]
             while chain[-1][1] in self.links:
@@ -1238,37 +1134,32 @@ def extract(
     gid: Optional[int] = None,
     mtime: Optional[float] = None,
 ) -> str:
-    """Extract the tar archive ``src``, a path or a binary file object that is read front to
-    back once, into ``dest``: a path, which is created if it does not exist and may be a symlink
-    to a dir, or the file descriptor of an open dir, which stays open. Entries already in
-    ``dest`` are not replaced: an archive with one of the same name is an error.
+    """Extract a tar archive ``src`` (a file path or readable binary stream) into ``dest`` (a
+    directory path or open directory file descriptor).
 
-    With ``root_marker``, only the contents of the parent of the shallowest member with that
-    name are extracted, and the archive name of that parent is returned. Other members must be
-    in it, except for the dirs leading up to it. Without, everything is extracted and ``""`` is
-    returned. Nothing is written through a symlink, and except on Windows, no path longer than a
-    single name is passed to the operating system.
+    ``dest`` is created if it does not exist. Existing entries in ``dest`` are never overwritten;
+    if any top-level entry from the archive already exists in ``dest``, ``untar.Error`` is raised
+    and ``dest`` is left untouched.
 
-    Files are created with ``file_mode``, without executable bits if the member is not
-    executable by its owner, and dirs with ``dir_mode``, which must give the owner rwx; with
-    ``gid``, both get that group. With ``mtime``, in seconds since the epoch, all files get
-    that modification time, as autotools tarballs need. Timestamps and ownership in the
-    archive are not restored.
-    Members must be regular files, dirs, symlinks or hardlinks, and cannot be absolute,
-    contain ``..`` or be more than 1024 dirs deep. Where links cannot be created, their
-    targets are copied."""
+    If ``root_marker`` is given, only the contents of the parent directory of the shallowest member
+    with that filename are moved into ``dest``, and that directory's path in the archive is
+    returned (or ``""`` when ``root_marker`` is omitted or at the archive root).
+
+    Files are created with ``file_mode`` (clearing all execute bits unless the archive entry has
+    owner execute permission ``0o100``), and directories with ``dir_mode`` (which must include
+    owner ``0o700``). If ``gid`` is set, extracted entries are assigned to that group; if ``mtime``
+    is set (in seconds since the epoch), all extracted files receive that modification time.
+    """
     if isinstance(dest, int) and not _DIR_FD:
         raise ValueError("dest cannot be a file descriptor on this platform")
     if gid is not None and _WINDOWS:
         raise ValueError("gid is not supported on Windows")
-    # Dir modes are set when dirs are created, and entries are then created in them
     if dir_mode & 0o700 != 0o700:
         raise ValueError(f"dir_mode {oct(dir_mode)} must give the owner rwx (0o700)")
     extractor = _Extractor(dest, root_marker, file_mode, dir_mode, gid, mtime)
     try:
         with _open_archive(src) as stream:
             reader = TarReader(stream)
-            # The reader reads the stream to its end, which verifies a gzip checksum
             for member in reader:
                 extractor.add(member, reader)
         return extractor.finish()
@@ -1277,7 +1168,7 @@ def extract(
 
 
 def _main(argv: Optional[List[str]] = None) -> int:
-    """``python -m untar <archive> <dest>``, like ``tar xf <archive> -C <dest>``."""
+    """CLI entry point: ``python -m untar <archive> <dest>``."""
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -1293,7 +1184,6 @@ def _main(argv: Optional[List[str]] = None) -> int:
     try:
         extract(src, args.dest)
     except (Error, OSError) as e:
-        # Like tar, exit with 2 on errors
         print(f"untar: {e}", file=sys.stderr)
         return 2
     return 0
