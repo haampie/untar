@@ -56,10 +56,8 @@ def entry(path: Path) -> dict:
     st = os.lstat(path)
     if stat.S_ISLNK(st.st_mode):
         # The separators in a target are backslashes on Windows, or it leads nowhere
-        return {
-            "kind": "symlink",
-            "target": os.readlink(str(path)).replace(os.sep, "/"),
-        }
+        target = os.readlink(str(path)).replace(os.sep, "/")
+        return {"kind": "symlink", "target": target}
     if stat.S_ISDIR(st.st_mode):
         return {"kind": "directory"}
     data = path.read_bytes()

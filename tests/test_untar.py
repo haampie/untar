@@ -405,21 +405,16 @@ def make_junction(path, target) -> None:
     import struct
 
     # A mount point: the name to substitute and the name to print, each with a NUL
-    names = [
-        ("\\??\\" + str(target)).encode("utf-16-le"),
-        str(target).encode("utf-16-le"),
-    ]
-    body = struct.pack("<4H", 0, len(names[0]), len(names[0]) + 2, len(names[1]))
-    body += names[0] + b"\0\0" + names[1] + b"\0\0"
+    names = ("\\??\\" + str(target), str(target))
+    sub, shown = [name.encode("utf-16-le") + b"\0\0" for name in names]
+    body = struct.pack("<4H", 0, len(sub) - 2, len(sub), len(shown) - 2) + sub + shown
     data = struct.pack("<IHH", 0xA0000003, len(body), 0) + body
     # FILE_WRITE_ATTRIBUTES is enough, sharing everything, without following a link
     handle = _winapi.CreateFile(str(path), 0x100, 7, 0, 3, 0x02200000, 0)
     try:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         arguments = (ctypes.c_void_p(handle), 0x000900A4, data, len(data), None, 0)
-        if not kernel32.DeviceIoControl(
-            *arguments, ctypes.byref(ctypes.c_ulong()), None
-        ):
+        done = ctypes.byref(ctypes.c_ulong())
+        if not untar._kernel32.DeviceIoControl(*arguments, done, None):
             raise ctypes.WinError(ctypes.get_last_error())
     finally:
         _winapi.CloseHandle(handle)
@@ -518,10 +513,14 @@ def test_dirs_in_use_cannot_be_made_junctions(tmp_path, monkeypatch):
 
 
 @windows
-@pytest.mark.parametrize("function", ["_open_dir", "_keeper"])
+@pytest.mark.parametrize(
+    "function,path",
+    [("_open_dir", os.path.join), ("_keeper", lambda h: untar._final_path(h, ""))],
+    ids=["_open_dir", "_keeper"],
+)
 @pytest.mark.parametrize("call", [1, 3], ids=["tmp", "pkg/empty"])
 def test_dirs_made_junctions_while_they_are_opened(
-    tmp_path, monkeypatch, function, call
+    tmp_path, monkeypatch, function, path, call
 ):
     """A dir can be made a junction between its creation and its opening: what is opened is
     asked whether it is a plain dir. It can also between that check and the creation of its
@@ -535,10 +534,7 @@ def test_dirs_made_junctions_while_they_are_opened(
     def swapped(*args):
         calls.append(args)
         if len(calls) == call:
-            dir = (
-                os.path.join(*args) if len(args) == 2 else untar._final_path(*args, "")
-            )
-            make_junction(dir, elsewhere)
+            make_junction(path(*args), elsewhere)
         return original(*args)
 
     monkeypatch.setattr(untar, function, swapped)
@@ -563,9 +559,7 @@ def test_no_entries_through_dirs_made_junctions(tmp_path, monkeypatch):
 
     monkeypatch.setattr(untar._Extractor, "add", attacked_add)
     members = IN_FLIGHT + [("pkg/empty/evil", "f", b"evil", 0o644)]
-    with pytest.raises(untar.Error, match="not a directory"):
-        untar.extract(io.BytesIO(make_tar(members)), str(tmp_path / "dest"))
-    assert os.listdir(tmp_path / "dest") == []
+    rejects(make_tar(members), tmp_path, "not a directory")
     assert os.listdir(elsewhere) == ["theirs"]
 
 
