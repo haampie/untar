@@ -255,14 +255,31 @@ def test_member_order_does_not_matter(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "name", ["/etc/passwd", "../passwd", "a/../../passwd", "a/../../../passwd"]
+    "name",
+    [
+        "/etc/passwd",
+        "../passwd",
+        "a/../../passwd",
+        "a/../../../passwd",
+        "C:/passwd",
+        "c:passwd",
+    ],
 )
 def test_unsafe_names(tmp_path, name):
-    """N12, N16: absolute names, and names with .."""
+    """N12, N16, N30: absolute names, names with .., and names with a drive letter, which
+    are absolute on Windows."""
     dest = tmp_path / "dest"
     with pytest.raises(untar.Error, match="unsafe path"):
         untar.extract(io.BytesIO(make_tar([(name, "f", b"x", 0o644)])), str(dest))
     assert os.listdir(tmp_path) == ["dest"] and os.listdir(dest) == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="no colons in names")
+@pytest.mark.parametrize("name", ["1:2", "ab:c", "d/C:", "./C:/f"])
+def test_names_with_colons(tmp_path, name):
+    """A drive letter is one letter, at the start of a name."""
+    untar.extract(io.BytesIO(make_tar([(name, "f", b"x", 0o644)])), str(tmp_path))
+    assert (tmp_path / name).read_bytes() == b"x"
 
 
 @pytest.mark.parametrize("name", ["...", "d/...", "d/....", "d/..x", "d/x.."])
@@ -998,16 +1015,6 @@ def test_symlink_chains_are_copied_where_unsupported(tmp_path, monkeypatch):
     for i in range(n + 1):
         assert (tmp_path / f"l{i}").read_bytes() == b"foo"
     assert len(copies) <= 2 * n
-
-
-def test_solaris_extended_header(tmp_path):
-    """Solaris tar writes pax headers with type X instead of x."""
-    data = bytearray(make_tar([("x" * 120, "f", b"long", 0o644)], tarfile.PAX_FORMAT))
-    assert data[156:157] == tarfile.XHDTYPE
-    data[156:157] = b"X"
-    data[148:156] = b"%06o\0 " % (sum(data[:148]) + sum(data[156:512]) + 256)
-    untar.extract(io.BytesIO(bytes(data)), str(tmp_path))
-    assert (tmp_path / ("x" * 120)).read_bytes() == b"long"
 
 
 @needs_symlinks

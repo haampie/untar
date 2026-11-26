@@ -133,12 +133,15 @@ in use. Files are created with `CREATE_NEW` and `FILE_FLAG_OPEN_REPARSE_POINT`, 
 once (from Python 3.8 on, whose `realpath` resolves them on Windows).
 
 Parsing is relatively strict: the idea is to reject tar files that would extract differently
-under tar implementations with more lenient parsing. Numbers must be plain digits, a member's name
-and size come from one header only, global pax headers cannot set them, names must be UTF-8
-without a NUL or backslash inside, only links have a link target, and links, dirs, devices and
-fifos cannot have a size. The rules are those of the default policy of
-[tar-minefield](https://github.com/haampie/tar-minefield), except that symlinks may point out of
-the archive, since untar does not follow them. The gzip checksum is always
+under tar implementations with more lenient parsing. Numbers must be plain digits with a
+terminator, a member's name and size come from one header only, global pax headers cannot set
+them, names and link targets must be UTF-8 without a NUL inside, names have no backslash or drive
+letter, and links, dirs, devices and fifos cannot have a size. The rules are those of the default
+policy of [tar-minefield](https://github.com/haampie/tar-minefield), as far as they are about what
+untar extracts. What it does not extract, it does not read: an owner or a timestamp that is not a
+number, the name of an extended header, and the mode of a hardlink are not looked at, although
+some implementations stop at such a header or make something else of it, so that no archive pays
+for checks of fields that are not used. The gzip checksum is always
 verified, and an archive may end after its last member or with two zero blocks, but only zeros may
 follow them, so that a second archive after the first does not go unnoticed. Without the two zero
 blocks, as in ruby's release tarballs, an uncompressed archive cut short between members cannot be
@@ -156,7 +159,9 @@ $ ruff check && ruff format --diff && mypy
 `tests/tar-minefield` is the test suite of [tar-minefield](https://github.com/haampie/tar-minefield),
 whose verdicts `tests/test_minefield.py` checks, and whose language the tests use: cases with
 an identifier such as `F12`, in the categories framing (F), names (N), kinds (K), and order and
-state (S), to reject, accept or tolerate.
+state (S), to reject, accept or tolerate. The few cases where untar differs are listed there, each
+with its reason: `REJECTED`, tolerated cases that it rejects, and `ACCEPTED`, cases to reject that
+it accepts.
 
 `tests/vendor/test_cpython.py` is adapted from CPython's `test_tarfile.py` and is under the PSF
 License Agreement included in it. The rest of untar is under the MIT license.

@@ -1,8 +1,10 @@
 """The test suite of tar-minefield, in tar-minefield/: archives, each a case with a verdict.
 
-untar is a strict parser. It must reject every case to reject, and extract the tree in the
-manifest of every case to accept. A tolerated case it may reject or extract, and REJECTED lists
-those it rejects. A rejection leaves the destination empty, and no case writes outside of it.
+untar is a strict parser. It must extract the tree in the manifest of every case to accept, and
+reject every case to reject, except those in ACCEPTED: untar does not read what it does not
+extract, such as owners, also where a strict parser would have to. A tolerated case it may
+reject or extract, and REJECTED lists those it rejects. A rejection leaves the destination
+empty, and no case writes outside of it.
 
 As in tar-minefield, an error that untar raises is a rejection, and so is one of the operating
 system that refuses an operation, such as creating a file that exists. Any other exception is a
@@ -32,6 +34,16 @@ ABSOLUTE = "/tmp/tar-minefield-absolute"
 REJECTED = {
     "F02": "data after the end-of-archive marker could be a second archive",
     "F14": "the size field has room for the pax size, but gives another",
+    "F55": "contiguous files are not supported",
+    "F66": "a file of 0 bytes is rather a failed download than an archive",
+}
+
+#: Cases to reject that untar accepts, by identifier: checking them would cost every archive
+#: time, for fields that are not extracted
+ACCEPTED = {
+    "F61": "the uid, the gid and the mtime are not extracted, and so not read",
+    "N52": "the name of an extended header is not read",
+    "S29": "the mode of a hardlink is not read, and that of its target not kept",
 }
 
 
@@ -116,7 +128,10 @@ def test_case(tmp_path, monkeypatch, case, links):
         assert os.listdir(dest) == []
 
     if info["verdict"] == "reject":
-        assert error is not None, f"accepts a case to reject, as {tree(dest)}"
+        if info["id"] in ACCEPTED:
+            assert error is None, f"rejects {info['id']}, which is in ACCEPTED: {error}"
+        else:
+            assert error is not None, f"accepts a case to reject, as {tree(dest)}"
         return
     expected = expected_tree(info, links == "supported")
     if expected is None or info["id"] in REJECTED:
@@ -131,9 +146,10 @@ def test_case(tmp_path, monkeypatch, case, links):
     assert tree(dest) == expected
 
 
-def test_rejected_are_tolerated():
-    """Every case has a manifest, and REJECTED names tolerated cases."""
+def test_exceptions_are_cases():
+    """Every case has a manifest, REJECTED names tolerated cases, and ACCEPTED cases to
+    reject."""
     infos = [manifest(case) for case in CASES]
     assert infos and len(infos) == len(list(SUITE.glob("*.json")))
-    tolerated = {info["id"] for info in infos if info["verdict"] == "tolerate"}
-    assert REJECTED.keys() <= tolerated
+    for verdict, exceptions in [("tolerate", REJECTED), ("reject", ACCEPTED)]:
+        assert exceptions.keys() <= {i["id"] for i in infos if i["verdict"] == verdict}

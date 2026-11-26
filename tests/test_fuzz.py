@@ -38,6 +38,8 @@ NUMBERS = [
     b"1",
     b"777",
     b"77777777777",
+    b"00000755",
+    b"000000000012",
     b"\x80" + bytes(10) + b"\x10",
     b"\x80" + b"\xff" * 11,
     b"\xff" * 12,
@@ -55,12 +57,26 @@ VALUES = {
         b"./a",
         b"a/",
         b"a/.",
+        b"C:/a",
+        b"a\0b",
         b"\xff\xfe",
     ],
     "mode": NUMBERS,
     "size": NUMBERS,
     "type": [bytes([t]) for t in b"012345675xgLKSXZ\0"],
-    "linkname": [b"", b".", b"..", b"/etc", b"pkg", b"../pkg", b"pkg/bin/app", b"\0x"],
+    "linkname": [
+        b"",
+        b".",
+        b"..",
+        b"/etc",
+        b"pkg",
+        b"../pkg",
+        b"pkg/bin/app",
+        b"pkg/bin/app/",
+        b"pkg\0x",
+        b"\0x",
+        b"\xff\xfe",
+    ],
     "magic": [b"ustar\x0000", b"ustar  \0", b"ustar\0\0\0", bytes(8)],
     "prefix": [b"", b"pkg", b"/", b"..", b"a/b"],
 }
@@ -78,6 +94,10 @@ RECORDS = [
     b"+9 path=x\n",
     b"99 path=x\n",
     b"25 GNU.sparse.size=1000\n",
+    b"13 mode=0755\n",
+    b"15 comment=a\nb\n",
+    b"17 linkpath=caf\xe9\n",
+    b"17 linkpath=a\nb/\n",
 ]
 
 
@@ -122,6 +142,9 @@ def mutate(archive: bytes, rng: random.Random) -> bytes:
             try:
                 size = untar._int(bytes(data[offset + 124 : offset + 136]))
             except untar.Error:
+                continue
+            if size > len(data):
+                # A size that an earlier round wrote
                 continue
             data[offset + 512 : offset + 512 + size] = records[:size].ljust(size, b"\0")
             continue

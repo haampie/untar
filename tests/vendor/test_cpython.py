@@ -109,13 +109,15 @@ def snapshot(root):
 sha256_regtype = "e09e4bc8b3c9d9177e77256353b36c159f5f040531bbd4b024a8f9b9196c71ce"
 sha256_sparse = "4f05a776071146756345ceee937b33fc5644f5a96b9780d1c7d6a32cdf164d7b"
 
-#: untar extracts only regular files, dirs and links, and rejects sparse and contiguous files
+#: untar extracts only regular files, dirs and links, and rejects sparse and contiguous files,
+#: and the extended headers of Solaris, which it reads as members
 UNSUPPORTED = (
     tarfile.CHRTYPE,
     tarfile.BLKTYPE,
     tarfile.FIFOTYPE,
     tarfile.GNUTYPE_SPARSE,
     tarfile.CONTTYPE,
+    tarfile.SOLARIS_XHDTYPE,
 )
 
 
@@ -150,6 +152,8 @@ REJECTED = [
     # Checksums that only match as the sum of signed bytes, which some readers refuse (F06)
     "misc/regtype-hpux-signed-chksum-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
     "misc/regtype-old-v7-signed-chksum-\udcc4\udcd6\udcdc\udce4\udcf6\udcfc\udcdf",
+    # A Solaris extended header, which readers take for a pax header or for a file (N33)
+    "misc/regtype-suntar",
     # A pax size, and 0 as the size in its header, which readers that ignore the pax size
     # read (F14)
     "pax/regtype4",
@@ -207,7 +211,7 @@ def test_members_like_tarfile():
                 content,
             )
         )
-    assert len(actual) == len(expected) == 24
+    assert len(actual) == len(expected) == 23
     for a, e in zip(actual, expected):
         assert a == e, e[0]
 
@@ -223,7 +227,6 @@ def test_checksums():
     for name in [
         "ustar/regtype",
         "misc/regtype-old-v7",
-        "misc/regtype-suntar",
         "misc/regtype-xstar",
         "pax/umlauts-\xc4\xd6\xdc\xe4\xf6\xfc\xdf",
         "pax/regtype1",

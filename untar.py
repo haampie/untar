@@ -40,21 +40,16 @@ LNKTYPE = b"1"
 SYMTYPE = b"2"
 DIRTYPE = b"5"
 _PAX_HEADER = b"x"
-_SOLARIS_PAX_HEADER = b"X"
 _PAX_GLOBAL_HEADER = b"g"
 _GNU_LONGNAME = b"L"
 _GNU_LONGLINK = b"K"
-_EXTENDED = (
-    _PAX_HEADER,
-    _SOLARIS_PAX_HEADER,
-    _PAX_GLOBAL_HEADER,
-    _GNU_LONGNAME,
-    _GNU_LONGLINK,
-)
+#: Not the extended headers of Solaris (X), which other readers take for files
+_EXTENDED = (_PAX_HEADER, _PAX_GLOBAL_HEADER, _GNU_LONGNAME, _GNU_LONGLINK)
 #: Not contiguous files (7), which some readers read without data
 _DATA_TYPES = (REGTYPE, AREGTYPE)
-#: Like tarfile, members of other types than these have data, also unknown ones
-_NO_DATA_TYPES = (LNKTYPE, SYMTYPE, DIRTYPE, b"3", b"4", b"6")
+#: Dirs, devices and fifos. Like tarfile, members of other types than these and links have
+#: data, also unknown ones.
+_NO_DATA_TYPES = (DIRTYPE, b"3", b"4", b"6")
 
 _WINDOWS = sys.platform == "win32"
 _BLOCK = 512
@@ -63,8 +58,24 @@ _EOF_BLOCK = bytes(_BLOCK)
 _PAX_SIZE = 8**11
 _CHUNK = 64 * 1024
 _BUF = 1024 * 1024
-#: Pax keys of sparse files other than GNU.sparse.*, of star and Solaris
-_SPARSE_KEYS = ("SCHILY.realsize", "SUN.holesdata")
+#: Pax keys that only some readers apply, to what is extracted: the encoding of names, a mode
+#: (which is not a pax key), sparse files of star and Solaris, and ACLs stored as xattrs
+_REFUSED_KEYS = frozenset(
+    (
+        b"hdrcharset",
+        b"mode",
+        b"SCHILY.realsize",
+        b"SUN.holesdata",
+        b"SCHILY.xattr.system.posix_acl_access",
+        b"SCHILY.xattr.system.posix_acl_default",
+        b"LIBARCHIVE.xattr.system.posix_acl_access",
+        b"LIBARCHIVE.xattr.system.posix_acl_default",
+    )
+)
+#: And those of GNU's sparse files, and of ACLs
+_REFUSED_PREFIXES = (b"GNU.sparse.", b"SCHILY.acl.")
+#: Pax keys of a member, which a global header cannot set
+_MEMBER_KEYS = frozenset((b"path", b"linkpath", b"size"))
 #: Pax and GNU long name headers are read into memory: limit their size per member
 _MAX_EXTENDED = 1024 * 1024
 #: Digits of a pax number: enough for any size
@@ -72,13 +83,13 @@ _MAX_DIGITS = 32
 #: The magics of headers: POSIX, with its version 00 or NULs as some Java archivers write it,
 #: GNU, and none (v7)
 _POSIX_MAGICS = (b"ustar\x0000", b"ustar\0\0\0")
-_OTHER_MAGICS = (b"ustar  \0", bytes(8))
-#: Pax keys that may have newlines in their values: xattrs, which are not extracted
-_XATTR_KEYS = (b"SCHILY.xattr.", b"LIBARCHIVE.xattr.")
+_V7_MAGIC = bytes(8)
+_OTHER_MAGICS = (b"ustar  \0", _V7_MAGIC)
 #: Dirs on the stack that stay open: the deepest ones, and shallower ones are reopened if needed
 _MAX_OPEN_DIRS = 64
 #: Path components per member: on macOS, creating an entry takes time linear in its depth
 _MAX_DEPTH = 1024
+_DRIVES = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _BadGzipFile = getattr(gzip, "BadGzipFile", OSError)
 
 
@@ -116,80 +127,102 @@ class Member:
         return f"Member({self.name!r}, type={self.type!r}, mode={oct(self.mode)}, size={self.size})"
 
 
-def _str(field: bytes) -> str:
-    """A field that ends at a NUL, such as a link target, which need not be UTF-8."""
-    return field.split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
-
-
-def _int(field: bytes) -> int:
-    """A numeric header field: octal, or base-256 (GNU)."""
+def _int(field: bytes, terminated: bool = True) -> int:
+    """A size: octal, or base-256 (GNU)."""
     if field[0] == 0o200:
         return int.from_bytes(field[1:], "big")
     elif field[0] == 0o377:
         raise Error("Archive contains a negative number")
-    return _octal(field)
+    return _octal(field, terminated)
 
 
-def _octal(field: bytes) -> int:
-    """Octal digits, with leading spaces and trailing spaces or NULs."""
-    digits = field.lstrip(b" ").rstrip(b" \0")
-    # Readers disagree on other padding: some skip a leading NUL or other whitespace, others
-    # stop there, and some read digits after a NUL.
-    if digits.strip(b"01234567"):
-        raise Error(f"Archive contains an invalid number {field!r}")
-    return int(digits, 8) if digits else 0
+def _octal(field: bytes, terminated: bool = True) -> int:
+    """Octal digits, after spaces and before spaces or NULs: a terminator, without which
+    readers take the last byte of a field for a digit or not."""
+    digits = field.rstrip(b" \0")
+    if not terminated or len(digits) < len(field):
+        if digits.isdigit():
+            try:
+                return int(digits, 8)
+            except ValueError:
+                pass
+        else:
+            # Readers disagree on other padding: some skip a leading NUL or other
+            # whitespace, others stop there, and some read digits after a NUL.
+            digits = digits.lstrip(b" ")
+            if not digits.strip(b"01234567"):
+                return int(digits, 8) if digits else 0
+    raise Error(f"Archive contains an invalid number {field!r}")
 
 
 def _name(raw: bytes) -> str:
-    """A name, which must be UTF-8: readers create other names as they are, or replace their
-    bytes."""
+    """A name or link target, which must be UTF-8: readers create other names as they are, or
+    replace their bytes."""
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         raise Error(f"Archive contains a name that is not UTF-8 {raw!r}") from None
 
 
-def _long_name(data: bytes) -> bytes:
+def _long_name(data: bytes) -> str:
     """A GNU long name or link, which ends with NULs. Readers disagree on a NUL inside it: some
-    stop there, others keep the rest."""
+    stop there, others keep the rest; and without a NUL, on where it ends."""
     name = data.rstrip(b"\0")
     if not name:
         raise Error("Archive contains an empty GNU long name")
-    if b"\0" in name:
+    if len(name) == len(data):
+        raise Error(
+            f"Archive contains a GNU long name without a NUL at its end {name!r}"
+        )
+    if 0 in name:
         raise Error(f"Archive contains a GNU long name with a NUL inside {name!r}")
-    return name
+    return _name(name)
 
 
-def _decimal(value: str, key: str) -> int:
-    """A pax decimal number, of ASCII digits only, without leading zeros."""
+def _pax_name(key: str, value: bytes) -> str:
+    """A pax path or linkpath."""
+    # An empty one removes the name in POSIX, and readers stop at a NUL or keep the rest
+    if not value or 0 in value:
+        raise Error(f"Archive contains an invalid pax {key} {value!r}")
+    # Records are delimited by their length, but some readers split them on newlines, and
+    # see other records. In what no reader uses, such as a comment, POSIX allows them.
+    if 0x0A in value:
+        raise Error(f"Archive contains a newline in the pax {key}")
+    return _name(value)
+
+
+def _pax_size(value: bytes) -> int:
+    """A pax size: a decimal number of ASCII digits only, without leading zeros."""
     # int() of thousands of digits is slow, and fails from Python 3.11 on. Some readers take
     # a leading zero for octal.
     if (
         not value
-        or value.strip("0123456789")
+        or value.strip(b"0123456789")
         or len(value) > _MAX_DIGITS
-        or (value[0] == "0" and len(value) > 1)
+        or (value[0] == 0x30 and len(value) > 1)
     ):
-        raise Error(f"Archive contains an invalid pax {key} {value[:_MAX_DIGITS]!r}")
+        raise Error(f"Archive contains an invalid pax size {value[:_MAX_DIGITS]!r}")
     return int(value)
 
 
 def _checksum_ok(header: bytes) -> bool:
     # Octal only: tar and libarchive refuse a base-256 checksum, and look for the next
-    # header in what follows
-    expected = _octal(header[148:156])
+    # header in what follows. Many archives have one of eight digits, without a terminator.
+    field = header[148:156]
+    expected = _octal(field, False)
     # adler32's low half is the byte sum mod 65521, which is exact for 256 bytes
     total = (zlib.adler32(header[:256], 0) & 0xFFFF) + (
         zlib.adler32(header[256:], 0) & 0xFFFF
     )
     # Not the signed sum, which some old tar implementations wrote: others refuse it, and some
     # look for the next header in what follows
-    return expected == total - sum(header[148:156]) + 256
+    return expected == total - sum(field) + 256
 
 
-def _pax_records(data: bytes) -> Dict[str, str]:
-    """Parse the ``<length> <key>=<value>\\n`` records of a pax extended header."""
-    records = {}
+def _pax_records(data: bytes) -> Dict[bytes, bytes]:
+    """Parse the ``<length> <key>=<value>\\n`` records of a pax extended header. Values are
+    not decoded: few are used."""
+    records: Dict[bytes, bytes] = {}
     pos = 0
     # The records fill the header: readers disagree on what follows a NUL in between
     while pos < len(data):
@@ -207,21 +240,14 @@ def _pax_records(data: bytes) -> Dict[str, str]:
         # GNU tar skips blanks before a key, and readers stop at a NUL in it or skip it
         if not key or not equals or key[0] in b" \t" or 0 in key:
             raise Error("Archive contains an invalid pax record")
-        name = key.decode("utf-8", "surrogateescape")
-        # Records are delimited by their length, but some readers split them on newlines
-        if 0x0A in value and not key.startswith(_XATTR_KEYS):
-            raise Error(f"Archive contains a newline in the pax {name}")
         # Readers take the first or the last of them
-        if name in records:
-            raise Error(f"Archive contains the pax {name} twice in one header")
-        records[name] = value.decode("utf-8", "surrogateescape")
+        if key in records:
+            raise Error(f"Archive contains the pax {key!r} twice in one header")
+        if key in _REFUSED_KEYS or key.startswith(_REFUSED_PREFIXES):
+            raise Error(f"Archive contains the pax {key!r}, which is not supported")
+        records[key] = value
         pos = end
     return records
-
-
-def _sparse(pax: Dict[str, str]) -> bool:
-    """Whether the pax records are those of a sparse file."""
-    return any(key.startswith("GNU.sparse.") or key in _SPARSE_KEYS for key in pax)
 
 
 def _fill(stream: IO[bytes], size: int) -> bytes:
@@ -331,6 +357,9 @@ class TarReader:
         self._more(_BLOCK)
         if not self.buf:
             raise Error("Archive is empty")
+        # Readers that decide what an archive is from its first header do not know pax headers
+        # after a v7 header, which has no magic, and take them for files
+        v7 = self.buf[257:265] == _V7_MAGIC
         padding = 0
         while True:
             self._skip(self.remaining + padding)
@@ -338,9 +367,9 @@ class TarReader:
 
             # Extended headers apply to the next member, and may give its name in one way only,
             # so that readers that resolve conflicts differently cannot see different members.
-            pax: Dict[str, str] = {}
-            long_name: Optional[str] = None
-            long_link: Optional[str] = None
+            name: Optional[str] = None
+            linkname: Optional[str] = None
+            pax_size: Optional[int] = None
             seen = b""
             budget = _MAX_EXTENDED
             while True:
@@ -359,6 +388,31 @@ class TarReader:
                     raise Error("Archive contains extended headers of more than 1 MiB")
                 data = self._read(size)
                 self._read(-size % _BLOCK)
+                if type == _GNU_LONGNAME or type == _GNU_LONGLINK:
+                    # Not bytes in bytes, which is slow
+                    if type[0] in seen:
+                        raise Error(
+                            f"Archive contains two {type!r} headers for one member"
+                        )
+                    # Each extends the next header, and does not know the other: a GNU long
+                    # name before a pax header can apply to the pax header, and a pax size
+                    # to a GNU long name.
+                    if _PAX_HEADER[0] in seen:
+                        raise Error(
+                            "Archive contains both a pax header and a GNU long name for "
+                            "one member"
+                        )
+                    if type == _GNU_LONGNAME:
+                        name = _long_name(data)
+                    else:
+                        linkname = _long_name(data)
+                    seen += type
+                    continue
+                if v7 or header[257:265] == _V7_MAGIC:
+                    raise Error(
+                        "Archive contains a pax header, and a header without magic"
+                    )
+                pax = _pax_records(data)
                 if type == _PAX_GLOBAL_HEADER:
                     # An extended header before it applies to it for some readers, and to
                     # the member for others
@@ -367,43 +421,29 @@ class TarReader:
                             "Archive contains a global pax header after an extended header"
                         )
                     # Readers disagree on whether these apply to later members: refuse them.
-                    if {"path", "linkpath", "size"} & _pax_records(data).keys():
+                    if not _MEMBER_KEYS.isdisjoint(pax):
                         raise Error(
                             "Archive contains a global pax path, linkpath or size"
                         )
                     continue
-                kind = _PAX_HEADER if type == _SOLARIS_PAX_HEADER else type
-                # Not bytes in bytes, which is slow
-                if kind[0] in seen:
-                    raise Error(f"Archive contains two {kind!r} headers for one member")
-                seen += kind
-                if kind == _PAX_HEADER:
-                    pax = _pax_records(data)
-                elif kind == _GNU_LONGNAME:
-                    long_name = _name(_long_name(data))
-                else:
-                    long_link = _long_name(data).decode("utf-8", "surrogateescape")
-            # Each extends the next header, and does not know the other: a GNU long name before
-            # a pax header can apply to the pax header, and a pax size to a GNU long name.
-            if len(seen) > 1 and _PAX_HEADER in seen:
-                raise Error(
-                    "Archive contains both a pax header and a GNU long name for one member"
-                )
-            if pax:
-                for key in ("path", "linkpath"):
-                    if key in pax and (not pax[key] or "\0" in pax[key]):
-                        raise Error(
-                            f"Archive contains an invalid pax {key} {pax[key]!r}"
-                        )
-                # Names that are not UTF-8 are refused, also where hdrcharset declares them
-                if "hdrcharset" in pax:
+                if seen:
                     raise Error(
-                        f"Archive contains the pax hdrcharset {pax['hdrcharset']}"
+                        "Archive contains two pax headers for one member"
+                        if _PAX_HEADER[0] in seen
+                        else "Archive contains both a pax header and a GNU long name for "
+                        "one member"
                     )
-                if "path" in pax:
-                    _name(pax["path"].encode("utf-8", "surrogateescape"))
+                seen = _PAX_HEADER
+                if b"path" in pax:
+                    name = _pax_name("path", pax[b"path"])
+                if b"linkpath" in pax:
+                    linkname = _pax_name("linkpath", pax[b"linkpath"])
+                if b"size" in pax:
+                    pax_size = _pax_size(pax[b"size"])
 
-            raw_name = header[0:100].rstrip(b"\0")
+            # A name ends at its first NUL
+            nul = header.find(b"\0", 0, 100)
+            raw_name = header[:nul] if nul >= 0 else header[:100]
             # Like GNU tar and libarchive, ustar headers have a name prefix, whatever their
             # version. Other headers have times there (GNU incremental), which some readers
             # take for a prefix.
@@ -421,67 +461,82 @@ class TarReader:
                 raise Error(
                     "Archive contains a name prefix in a header that is not ustar"
                 )
-            if long_name is not None:
-                name = long_name
-            elif "path" in pax:
-                name = pax["path"]
-            else:
-                # A name ends at its first NUL, but some readers keep what follows
-                if 0 in raw_name:
+            if name is None:
+                # Some readers keep what follows the NUL
+                if nul >= 0 and header.count(b"\0", nul, 100) != 100 - nul:
                     raise Error(
-                        f"Archive contains bytes after the NUL of the name {raw_name!r}"
+                        f"Archive contains bytes after the NUL of the name {header[:100]!r}"
                     )
                 name = _name(raw_name)
             # A separator on Windows, and a character elsewhere
             if "\\" in name:
                 raise Error(f"Archive contains a backslash in the name {name}")
-            if type == AREGTYPE:
-                # Old tar implementations write dirs as files named with a slash. tarfile
-                # looks for it in the name in the header, others in the final name.
-                slash = raw_name.partition(b"\0")[0].endswith(b"/")
-                if slash != name.endswith("/"):
-                    raise Error(f"Archive contains {name}, named like a directory once")
-                if slash:
-                    type = DIRTYPE
-            if type == b"S" or pax and _sparse(pax):
-                raise Error(
-                    f"Archive contains a sparse file {name}, which is not supported"
-                )
+            if type == AREGTYPE and name.endswith("/"):
+                # Old tar implementations write dirs as files named with a slash, in the
+                # header, where an extended header gives a file its name
+                if not raw_name.endswith(b"/"):
+                    raise Error(
+                        f"Archive contains {name}, named like a directory by its extended "
+                        "header only"
+                    )
+                type = DIRTYPE
 
-            if type == DIRTYPE:
-                name = name.rstrip("/") or name
-            size = _int(header[124:136])
-            if "size" in pax:
-                pax_size = _decimal(pax["size"], "size")
+            # Octal: a mode fits, and not every reader of base-256 sizes reads one in base-256
+            mode = _octal(header[100:108])
+            if pax_size is None:
+                size = _int(header[124:136])
+            else:
                 # Readers without pax support use the ustar size. Writers only use a pax
-                # size that is too large for it, and then write 0 or the same size there.
+                # size that is too large for it, and then write 0 there or the same size:
+                # bsdtar in twelve digits, without a terminator.
+                size = _int(header[124:136], False)
                 if pax_size != size and (size or pax_size < _PAX_SIZE):
                     raise Error(
                         f"Archive contains {name} with pax size {pax_size} and size {size}"
                     )
                 size = pax_size
-            if long_link is None:
-                if "linkpath" in pax:
-                    long_link = pax["linkpath"]
-                else:
-                    long_link = _str(header[157:257]) if header[157] else ""
-            # Readers that look at the link target rather than the type make a link of it
-            if long_link and type != LNKTYPE and type != SYMTYPE:
-                raise Error(
-                    f"Archive contains {name} of type {type!r} with a link target"
-                )
-            member = Member(name, type, _int(header[100:108]), size, long_link)
 
-            if type not in _NO_DATA_TYPES:
-                self.remaining = member.size
-            elif member.size:
-                # Readers disagree on whether data follows: tar and tarfile skip the size of a
-                # dir, and take that of other types for data.
-                raise Error(
-                    f"Archive contains {name} of type {type!r} with size {member.size}"
-                )
+            if type in _DATA_TYPES:
+                # A link target of a file is not read: readers make a file of it
+                linkname = ""
+                self.remaining = size
+            elif type == SYMTYPE or type == LNKTYPE:
+                if linkname is None:
+                    raw = header[157:257].rstrip(b"\0")
+                    # As in a name, some readers keep what follows a NUL
+                    if 0 in raw:
+                        raise Error(
+                            f"Archive contains bytes after the NUL of the link target {raw!r}"
+                        )
+                    linkname = _name(raw)
+                # Readers disagree on whether data follows: tar and tarfile take the size of
+                # a link for data.
+                if size:
+                    raise Error(
+                        f"Archive contains {name} of type {type!r} with size {size}"
+                    )
+            else:
+                # Readers that look at the link target rather than the type make a link of it
+                if linkname is not None or header[157]:
+                    raise Error(
+                        f"Archive contains {name} of type {type!r} with a link target"
+                    )
+                linkname = ""
+                if type == DIRTYPE:
+                    name = name.rstrip("/") or name
+                if type not in _NO_DATA_TYPES:
+                    if type == b"S":
+                        raise Error(
+                            f"Archive contains a sparse file {name}, which is not supported"
+                        )
+                    self.remaining = size
+                elif size:
+                    # tar and tarfile skip the size of a dir
+                    raise Error(
+                        f"Archive contains {name} of type {type!r} with size {size}"
+                    )
             padding = -self.remaining % _BLOCK
-            yield member
+            yield Member(name, type, mode, size, linkname)
 
 
 class _Prepend:
@@ -548,6 +603,9 @@ def _parts(name: str) -> List[str]:
     if (
         name.startswith("/")
         or ".." in parts
+        # A drive letter, which makes a name absolute on Windows, and is a name elsewhere
+        or name[1:2] == ":"
+        and name[0] in _DRIVES
         or _WINDOWS
         and any("\\" in p or ":" in p for p in parts)
     ):
@@ -1041,6 +1099,12 @@ class _Extractor:
             if self.chown:
                 os.chown(path, -1, self.gid, dir_fd=dir_fd, follow_symlinks=False)  # type: ignore
         elif member.islnk():
+            # A name that ends in a slash is that of a dir only, which a hardlink cannot be
+            # to: readers drop the slash, or find no such member
+            if member.linkname.endswith(("/", "/.")):
+                raise Error(
+                    f"Archive hardlinks {member.linkname}, named like a directory"
+                )
             source = _parts(member.linkname)
             # tar archives an entry listed twice as a hardlink to itself, which readers
             # replace, empty, or leave alone

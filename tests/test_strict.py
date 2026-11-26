@@ -153,7 +153,7 @@ def test_pax_numbers_with_zero_padding(tmp_path, size):
 
 
 def test_valid_numbers():
-    """F01: leading and trailing spaces and NULs, octal without terminator, and base-256."""
+    """F01, F56: leading and trailing spaces and NULs, and base-256."""
     for size in [
         b"  3",
         b"3 ",
@@ -163,6 +163,37 @@ def test_valid_numbers():
         b"\x80" + (3).to_bytes(11, "big"),
     ]:
         assert members(header(size=size) + data(b"abc") + EOF) == [("f", "", 3)]
+
+
+def test_sizes_without_terminator(tmp_path):
+    """F40: implementations take the last byte of a field for a digit, or for its
+    terminator. bsdtar writes sizes from 8 GiB on so, with a pax size, which is the size."""
+    archive = header(size=b"000000000012") + data(b"0123456789") + EOF
+    rejects(archive, tmp_path, "invalid number")
+    large = b"%012o" % untar._PAX_SIZE
+    archive = extended(b"x", record("size", str(untar._PAX_SIZE))) + header(size=large)
+    assert next(iter(untar.TarReader(io.BytesIO(archive)))).size == untar._PAX_SIZE
+
+
+@pytest.mark.parametrize(
+    "mode", [b"\x80" + (0o755).to_bytes(7, "big"), b"00000755", b"0000o755"]
+)
+def test_invalid_modes(tmp_path, mode):
+    """K13: not every reader of sizes in base-256 reads a mode in base-256, which decides
+    whether a file is executable."""
+    h = bytearray(header(size=1))
+    h[100:108] = mode
+    rejects(checksum(h) + data(b"x") + EOF, tmp_path, "invalid number")
+
+
+def test_numbers_outside_the_tree_are_not_read():
+    """F61, F79, F80: the owner and the time of a member are not extracted, and not read
+    either: not even where implementations stop at a header because of them."""
+    h = bytearray(header(size=1))
+    h[108:116] = b"0000008\0"
+    h[116:124] = b"\x80" + bytes(7)
+    h[136:148] = b"not a number"
+    assert members(checksum(h) + data(b"x") + EOF) == [("f", "", 1)]
 
 
 def test_negative_sizes():
@@ -248,21 +279,37 @@ def test_invalid_pax_records(tmp_path, records):
     rejects(extended(b"x", records) + member() + EOF, tmp_path, "invalid pax")
 
 
-@pytest.mark.parametrize("key", ["path", "comment", "mtime"])
-def test_newlines_in_pax_values(tmp_path, key):
-    """F13, F28: records are delimited by their length, but some implementations split them
-    on newlines, and see another record."""
-    archive = extended(b"x", record(key, "x\n12 size=512")) + member("f", b"abc") + EOF
+@pytest.mark.parametrize("key", ["path", "linkpath"])
+def test_newlines_in_pax_names(tmp_path, key):
+    """F13: records are delimited by their length, but some implementations split them on
+    newlines, and see another record."""
+    archive = (
+        extended(b"x", record(key, "x\n12 size=512"))
+        + member("f", type=b"2", linkname="t")
+        + EOF
+    )
     rejects(archive, tmp_path, "newline")
 
 
-def test_newlines_in_xattrs(tmp_path):
-    """Except in xattrs, which some archives have, and which are not extracted."""
+@pytest.mark.parametrize("key", ["comment", "mtime", "SCHILY.xattr.user.k"])
+def test_newlines_in_other_pax_values(tmp_path, key):
+    """F28, F57, F58: POSIX allows them in a comment, and some archives have them in xattrs.
+    The values that are not extracted are not read."""
     archive = (
-        extended(b"x", record("SCHILY.xattr.user.k", "a\nb"))
+        extended(b"x", record(key, "x\n12 size=512"))
         + member("f", b"abc")
+        + member("after", b"x")
         + EOF
     )
+    untar.extract(io.BytesIO(archive), str(tmp_path))
+    assert (tmp_path / "f").read_bytes() == b"abc"
+    assert (tmp_path / "after").read_bytes() == b"x"
+
+
+@pytest.mark.parametrize("key", ["comment", "uname", "SCHILY.xattr.user.k"])
+def test_pax_values_that_are_not_utf8(tmp_path, key):
+    """F31, F42: only names are decoded."""
+    archive = extended(b"x", record(key, b"caf\xe9\0")) + member("f", b"abc") + EOF
     untar.extract(io.BytesIO(archive), str(tmp_path))
     assert (tmp_path / "f").read_bytes() == b"abc"
 
@@ -359,12 +406,37 @@ def test_unknown_types_have_data():
 
 
 @pytest.mark.parametrize(
-    "key,value", [("SCHILY.realsize", "10000"), ("SUN.holesdata", " 0 512")]
+    "key,value",
+    [
+        ("SCHILY.realsize", "10000"),
+        ("SUN.holesdata", " 0 512"),
+        ("GNU.sparse.size", "10000"),
+        ("GNU.sparse.name", "other"),
+    ],
 )
-def test_sparse_pax_keys(tmp_path, key, value):
-    """Some implementations make a sparse file of these, with other contents."""
-    archive = extended(b"x", record(key, value)) + member("f", b"A" * 1024) + EOF
-    rejects(archive, tmp_path, "sparse")
+@pytest.mark.parametrize("type", [b"x", b"g"])
+def test_sparse_pax_keys(tmp_path, type, key, value):
+    """F62, N36, N41: some implementations make a sparse file of these, with other contents
+    or another name."""
+    archive = extended(type, record(key, value)) + member("f", b"A" * 1024) + EOF
+    rejects(archive, tmp_path, "not supported")
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("mode", "0755"),
+        ("SCHILY.acl.access", "user::rwx,group::r-x,other::r-x"),
+        ("SCHILY.acl.default", "user::rwx"),
+        ("SCHILY.xattr.system.posix_acl_access", "\2\0\0\0"),
+        ("LIBARCHIVE.xattr.system.posix_acl_access", "AgAAAA"),
+    ],
+)
+def test_pax_keys_of_permissions(tmp_path, key, value):
+    """K11, K12: a mode, which is not a pax key, and ACLs make a file executable for the
+    implementations that apply them."""
+    archive = extended(b"x", record(key, value)) + member("f", b"x") + EOF
+    rejects(archive, tmp_path, "not supported")
 
 
 def test_contiguous_files(tmp_path):
@@ -483,7 +555,6 @@ def test_zeros_after_end_of_archive_marker(tmp_path, compress):
     "headers",
     [
         extended(b"x", record("path", "a")) + extended(b"x", record("path", "b")),
-        extended(b"x", record("path", "a")) + extended(b"X", record("size", "1")),
         extended(b"L", b"a\0") + extended(b"L", b"b\0"),
         extended(b"K", b"a\0") + extended(b"K", b"b\0"),
     ],
@@ -509,11 +580,38 @@ def test_pax_and_gnu_names(tmp_path, headers):
     rejects(headers + member("f", type=b"2", linkname="t") + EOF, tmp_path, "both")
 
 
+def test_solaris_extended_headers(tmp_path):
+    """N33: Solaris tar writes pax headers with type X, which other implementations extract
+    as a file, or skip."""
+    archive = extended(b"X", record("path", "a")) + member("f", b"x") + EOF
+    assert [name for name, _, _ in members(archive)] == ["pax", "f"]
+    rejects(archive, tmp_path, "unsupported type")
+
+
+@pytest.mark.parametrize("type", [b"x", b"g"])
+def test_pax_headers_without_magic(tmp_path, type):
+    """F39, F54: implementations that decide what an archive is from its first header take
+    a pax header after a v7 header for a file, and others one without magic."""
+    pax = extended(type, record("comment", "hi"))
+    v7 = bytearray(pax[:512])
+    v7[257:265] = bytes(8)
+    for archive in [
+        member("first", magic=bytes(8)) + pax + member("f", b"x"),
+        member("first") + checksum(v7) + pax[512:] + member("f", b"x"),
+    ]:
+        rejects(archive + EOF, tmp_path, "header without magic")
+    # GNU long names are not pax, and old tar implementations wrote them without ustar
+    archive = member("first", magic=bytes(8)) + extended(b"L", b"long\0") + member()
+    assert [name for name, _, _ in members(archive + EOF)] == ["first", "long"]
+
+
 @pytest.mark.parametrize(
-    "key,value", [("path", ""), ("linkpath", ""), ("path", "a\0b")]
+    "key,value",
+    [("path", ""), ("linkpath", ""), ("path", "a\0b"), ("linkpath", "a\0b")],
 )
 def test_invalid_pax_names(tmp_path, key, value):
-    """N19, N22: a NUL inside a pax path, and an empty one, which POSIX says removes it."""
+    """N19, N22, N34: a NUL inside a pax path, and an empty one, which POSIX says removes
+    it."""
     archive = (
         extended(b"x", record(key, value)) + member("f", type=b"2", linkname="t") + EOF
     )
@@ -540,6 +638,14 @@ def test_gnu_long_names_with_nul_inside(tmp_path, type):
 def test_gnu_long_names_end_with_nuls():
     archive = extended(b"L", b"name\0\0") + member("f", type=b"2", linkname="t") + EOF
     assert members(archive) == [("name", "t", 0)]
+
+
+@pytest.mark.parametrize("type", [b"L", b"K"])
+def test_gnu_long_names_without_nul(tmp_path, type):
+    """N39: a size that leaves out the NUL: implementations read the name up to its size, or
+    up to the NUL after it."""
+    h = header("././@LongLink", type, 4) + data(b"name-rest")
+    rejects(h + member("f", type=b"2", linkname="t") + EOF, tmp_path, "without a NUL")
 
 
 @pytest.mark.parametrize("type", [b"L", b"K"])
@@ -611,6 +717,29 @@ def test_names_that_are_not_utf8(tmp_path):
     rejects(extended(b"x", hdrcharset) + member() + EOF, tmp_path, "hdrcharset")
 
 
+def test_link_targets_that_are_not_utf8(tmp_path):
+    """N31, N32: as names."""
+    h = bytearray(header("link", b"2", linkname="cafe"))
+    h[157 + 3] = 0xE9
+    for headers in [
+        b"",
+        extended(b"x", record("linkpath", b"caf\xe9")),
+        extended(b"K", b"caf\xe9\0"),
+    ]:
+        rejects(headers + checksum(h) + EOF, tmp_path, "not UTF-8")
+
+
+@pytest.mark.parametrize("type", [b"1", b"2"])
+def test_bytes_after_nul_in_link_targets(tmp_path, type):
+    """N51: as in a name."""
+    archive = member("t", b"x") + member("l", type=type, linkname="t\0../x") + EOF
+    rejects(archive, tmp_path, "after the NUL")
+    # Unless a pax linkpath or a GNU long link gives the target
+    for headers in [extended(b"x", record("linkpath", "t")), extended(b"K", b"t\0")]:
+        archive = headers + member("l", type=type, linkname="u\0v") + EOF
+        assert members(archive) == [("l", "t", 0)]
+
+
 @pytest.mark.parametrize("name", ["a\\b", "..\\a"])
 def test_backslashes_in_names(tmp_path, name):
     """N13: a separator on Windows, and a character elsewhere."""
@@ -631,20 +760,30 @@ def test_empty_symlink_target(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "headers,name",
-    [
-        (extended(b"x", record("path", "file")), "dir/"),
-        (extended(b"L", b"file\0"), "dir/"),
-        (extended(b"x", record("path", "dir/")), "file"),
-    ],
-    ids=["pax path", "GNU long name", "pax dir"],
+    "headers",
+    [extended(b"x", record("path", "dir/")), extended(b"L", b"dir/\0")],
+    ids=["pax path", "GNU long name"],
 )
-def test_old_dirs_named_like_dirs_once(tmp_path, headers, name):
-    """Old tar implementations write dirs as files named with a slash. Some implementations
-    look for it in the name in the header, others in the final name: a file there has data,
-    and a dir has none, which is where the others see a member."""
-    archive = headers + header(name, b"\0", 1024) + member("hidden", bytes(1024)) + EOF
-    rejects(archive, tmp_path, "named like a directory")
+def test_old_dirs_named_like_dirs_once(tmp_path, headers):
+    """Old tar implementations write dirs as files named with a slash, in the header. Some
+    implementations look for it there, others in the final name: a file has data, and a dir
+    has none, which is where the others see a member."""
+    archive = headers + header("file", b"\0", 1024) + member("hidden", bytes(1024))
+    rejects(archive + EOF, tmp_path, "named like a directory")
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [extended(b"x", record("path", "long/file")), extended(b"L", b"long/file\0")],
+    ids=["pax path", "GNU long name"],
+)
+def test_old_files_with_a_long_name_cut_at_a_slash(tmp_path, headers):
+    """N45: the header has the start of a long name, which may end in a slash, as in the
+    sdists that maturin wrote. The file is one by its long name."""
+    archive = headers + header("long/", b"\0", 3) + data(b"abc") + member("after") + EOF
+    untar.extract(io.BytesIO(archive), str(tmp_path))
+    assert (tmp_path / "long" / "file").read_bytes() == b"abc"
+    assert (tmp_path / "after").read_bytes() == b""
 
 
 def test_old_dirs_named_like_dirs():
@@ -652,20 +791,30 @@ def test_old_dirs_named_like_dirs():
     assert members(archive) == [("long", "", 0)]
 
 
-@pytest.mark.parametrize(
-    "archive",
-    [
-        member("f", b"x", linkname="t"),
-        member("d/", type=b"5", linkname="t"),
-        extended(b"x", record("linkpath", "t")) + member("f", b"x"),
-        extended(b"K", b"t\0") + member("f", b"x"),
-    ],
-    ids=["file", "dir", "pax linkpath", "GNU long link"],
-)
-def test_link_targets_of_other_kinds(tmp_path, archive):
-    """K02: implementations that look at the link target rather than the type make a link
-    of the member."""
-    rejects(archive + EOF, tmp_path, "with a link target")
+LINK_TARGETS = [
+    lambda **kwargs: member(linkname="t", **kwargs),
+    lambda **kwargs: extended(b"x", record("linkpath", "t")) + member(**kwargs),
+    lambda **kwargs: extended(b"K", b"t\0") + member(**kwargs),
+]
+
+
+@pytest.mark.parametrize("target", LINK_TARGETS, ids=["header", "pax", "GNU long link"])
+@pytest.mark.parametrize("type", [b"5", b"3", b"6", b"Z"])
+def test_link_targets_of_other_kinds(tmp_path, target, type):
+    """Implementations that look at the link target rather than the type make a link of the
+    member."""
+    rejects(target(name="d", type=type) + EOF, tmp_path, "with a link target")
+
+
+@pytest.mark.parametrize("target", LINK_TARGETS, ids=["header", "pax", "GNU long link"])
+@pytest.mark.parametrize("type", [b"0", b"\0"])
+def test_link_targets_of_files(tmp_path, target, type):
+    """K02, K16: except of a file, which is one for the implementations that accept it. Its
+    link target is not read."""
+    archive = target(name="f", content=b"x", type=type) + EOF
+    assert members(archive) == [("f", "", 1)]
+    untar.extract(io.BytesIO(archive), str(tmp_path))
+    assert (tmp_path / "f").read_bytes() == b"x"
 
 
 @pytest.mark.parametrize("name", ["file/", "dir/.", "dir/./"])
@@ -688,6 +837,14 @@ def test_non_directories_named_like_directories(tmp_path, name):
 def test_invalid_hardlinks(tmp_path, archive):
     """S03, S13: hardlinks to a dir, to nothing, or to a member that does not exist."""
     rejects(archive, tmp_path, "hardlinks")
+
+
+@pytest.mark.parametrize("linkname", ["f/", "f/.", "./f//"])
+def test_hardlink_targets_named_like_directories(tmp_path, linkname):
+    """S28: such a name is that of a dir only. Implementations drop the slash, or find no
+    such member."""
+    archive = member("f", b"x") + member("h", type=b"1", linkname=linkname) + EOF
+    rejects(archive, tmp_path, "named like a directory")
 
 
 @pytest.mark.parametrize("linkname", ["f", "./f"])
