@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, "releases/**"]
   pull_request:
 
 jobs:
@@ -81,3 +81,18 @@ jobs:
       - run: ruff check
       - run: ruff format --diff
       - run: mypy
+      - name: The version fits the branch
+        shell: sh
+        run: |
+          version=$(python -c 'import untar; print(untar.__version__)')
+          case "$BRANCH" in
+            main) pattern="*.0.dev0" ;;
+            releases/v*) pattern="${BRANCH#releases/v}.*" ;;
+            *) pattern="*" ;;
+          esac
+          case "$version" in
+            $pattern) ;;
+            *) echo "$BRANCH takes $pattern, not $version"; exit 1 ;;
+          esac
+        env:
+          BRANCH: ${{ github.base_ref || github.ref_name }}

@@ -1,5 +1,7 @@
 name: release
 
+# A release is a tag vX.Y.Z on releases/vX.Y, of a commit that sets __version__ to X.Y.Z.
+# In between, main has X.Y.0.dev0 and a release branch has X.Y.Z.dev0.
 on:
   push:
     tags: ["v*"]
@@ -9,6 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
           python-version: "3.14"
@@ -17,6 +21,8 @@ jobs:
       - run: twine check --strict dist/*
       - name: The tag matches the version
         run: test "${GITHUB_REF_NAME}" = "v$(python -c 'import untar; print(untar.__version__)')"
+      - name: The tag is on its release branch
+        run: git merge-base --is-ancestor HEAD "origin/releases/${GITHUB_REF_NAME%.*}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: dist
