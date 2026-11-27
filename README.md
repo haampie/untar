@@ -22,15 +22,16 @@ From the command line (use `-` for standard input):
 $ python -m untar pkg.tar.gz /opt/pkg
 ```
 
-The destination directory is created if it does not exist. If any top-level entry from the archive
-already exists in the destination, extraction fails and leaves the destination unchanged (exiting
-with status 2 on the CLI).
+The destination directory is created if it does not exist. Unlike GNU `tar` or `tarfile.extractall`,
+`untar` does not merge into existing directories or overwrite files: if any top-level entry from the
+archive already exists in the destination, extraction fails with `FileExistsError` and leaves the
+destination unchanged.
 
 An invalid or unsafe archive raises `untar.Error`, and one compressed in a format that this Python
 cannot decompress raises its subclass `untar.UnsupportedCompression`. Operations that the operating
-system refuses raise `OSError` instead, notably `FileExistsError` for a name that occurs twice in an
-archive, since entries are never replaced. Catch `(untar.Error, OSError)` to handle every rejected
-archive.
+system refuses raise `OSError` instead, including `FileExistsError` when an archive contains
+duplicate entry names or collides with an existing destination entry. Catch `(untar.Error, OSError)`
+to handle every rejected archive.
 
 ### Options
 
@@ -47,43 +48,30 @@ archive.
   `file_mode` when the archive marks it executable by its owner (`0o100`).
 - `mtime`: optional modification time (in seconds since the epoch) applied to all extracted files.
   By default, files keep their extraction timestamp; setting a uniform `mtime` avoids timestamp skew
-  in archives such as autotools releases where `configure` is stored before `configure.ac`.
+  in build systems such as autotools.
 
 ## Safety
 
-- **Atomic against archive errors:** Members are extracted into a temporary directory inside the
-  destination and moved into place only after the full stream (including the checksum of its
-  compression) has been read and verified. An invalid archive leaves the destination untouched, as
-  does a truncated one that is compressed or cut inside a member. The end-of-archive marker is
-  optional (ruby's release tarballs lack it), so an uncompressed archive cut exactly between two
-  members cannot be told apart from a complete one.
-- **No traversal or overwrites:** Absolute paths, `..` components, backslashes, and Windows drive
-  letters are rejected. Directories are opened with `O_NOFOLLOW` and files are created with
-  `O_EXCL | O_NOFOLLOW`, so `untar` never writes through symlinks or overwrites existing files.
-  Symlinks and hardlinks are extracted, while device nodes, FIFOs, and sparse files are rejected.
-  Where the platform or filesystem does not support links, the file a link points to is copied
-  instead, and a symlink that cannot be copied (one to a directory, or to a target outside the
-  archive) is an error rather than silently dropped.
-  On Windows, where creating symlinks takes a privilege or developer mode, the separators in a
-  symlink's target are stored as backslashes, and a symlink to a directory in the archive is created
-  as one, also when that directory comes later in the archive: other symlinks lead nowhere there.
-- **Race-free directory traversal:** On POSIX, entries are created relative to open directory file
-  descriptors (`dir_fd`), preventing time-of-check-to-time-of-use (TOCTOU) races where a directory
-  is swapped for a symlink during extraction and avoiding OS `PATH_MAX` limits. On Windows, which
-  lacks `dir_fd`, `untar` uses extended-length paths (`\\?\`), creates files with
-  `CREATE_NEW | FILE_FLAG_OPEN_REPARSE_POINT`, and keeps every directory on the path to an entry
-  open: without delete sharing, so that neither the directory nor its ancestors can be renamed or
-  removed, and with a file in it that only `untar` can remove, since Windows lets only an empty
-  directory be made a junction or symlink. Whether a directory is a plain one is asked of its open
-  handle rather than of its path, and so is where the destination is once links on the way to it
-  are resolved.
-- **Strict, unambiguous parsing:** `untar` follows the default policy of
-  [tar-minefield](https://stoppels.ch/tar) to reject ambiguous archives that different tar
-  implementations interpret differently (such as conflicting extended headers, non-octal numeric
-  fields, non-UTF-8 paths, embedded NUL bytes, trailing data after the end-of-archive marker, or
-  sizes on non-file entries). Header fields that `untar` does not use (`uid`, `gid`, `mtime`,
-  `uname`, `gname`, and the ustar `name` of an extended header block) are skipped so parsing does
-  not pay to validate unused metadata.
+Extraction is staged in a temporary directory inside `dest` and moved into place only after the
+entire stream (including any compression checksum) has been verified. A broken or truncated archive
+leaves `dest` untouched (except for an uncompressed archive cut cleanly on a member boundary, as the
+tar end-of-archive marker is optional).
+
+`untar` never overwrites existing files or follows symlinks along the extraction path. Absolute
+paths, `..` components, backslashes, Windows drive letters, device nodes, FIFOs, and sparse files
+are rejected. To prevent time-of-check-to-time-of-use (TOCTOU) symlink races and bypass `PATH_MAX`
+limits, entries are created through open directory descriptors on POSIX and locked directory handles
+with extended-length (`\\?\`) paths on Windows.
+
+Symlinks and hardlinks are extracted natively. When the platform or filesystem does not allow
+creating a link (such as Windows without Developer Mode), `untar` copies the target file instead; if
+the target cannot be copied (a directory or a path outside the archive), extraction fails rather
+than silently skipping the link.
+
+Archive headers are parsed strictly according to [tar-minefield](https://stoppels.ch/tar), rejecting
+ambiguous constructs that different tar implementations interpret differently (such as conflicting
+extended headers, non-octal numeric fields, non-UTF-8 paths, embedded NUL bytes, or trailing data
+after the end-of-archive marker).
 
 ## Performance
 
