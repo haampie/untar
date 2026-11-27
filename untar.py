@@ -16,6 +16,8 @@ import zlib
 from typing import IO, Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 if sys.platform == "win32":
+    if sys.version_info < (3, 11):
+        raise ImportError("untar needs Python 3.11 or later on Windows")
     import _winapi
     import ctypes
     import msvcrt

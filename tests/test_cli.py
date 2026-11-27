@@ -72,3 +72,17 @@ def test_imports_no_compression(tmp_path):
         [sys.executable, "-S", "-c", code], cwd=str(tmp_path), env=ENV
     )
     assert out.strip() == b"[]"
+
+
+def test_old_python_on_windows(tmp_path):
+    """Windows takes Python 3.11: older ones fail with names outside of the code page."""
+    code = "import sys; sys.platform, sys.version_info = 'win32', (3, 10); import untar"
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", code],
+        stderr=subprocess.PIPE,
+        cwd=str(tmp_path),
+        env=ENV,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert b"ImportError: untar needs Python 3.11 or later on Windows" in result.stderr
