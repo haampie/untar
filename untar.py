@@ -29,7 +29,7 @@ if sys.platform == "win32":
     _FILE_ATTRIBUTE_NORMAL = 0x80
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 
-__version__ = "0.6.0.dev0"
+__version__ = "1.0.0.dev0"
 __all__ = ["Error", "Member", "TarReader", "extract"]
 
 REGTYPE = b"0"
