@@ -3,6 +3,7 @@ import errno
 import gzip
 import importlib.util
 import io
+import itertools
 import os
 import random
 import shutil
@@ -266,6 +267,61 @@ def test_member_order_does_not_matter(tmp_path):
             == "opt/store/pkg"
         )
         assert sorted(os.listdir(dest)) == [".meta", "README", "bin", "lib"]
+
+
+def outcome(members, dest, **kwargs):
+    """What extracting the members gives: the root and the tree, or the error."""
+    try:
+        root = untar.extract(io.BytesIO(make_tar(members)), str(dest), **kwargs)
+    except (untar.Error, OSError) as e:
+        assert os.listdir(dest) == []
+        return type(e), str(e)
+    return root, snapshot(dest)
+
+
+#: Files that are next to each other or the same by different names, that are refused in some
+#: places, and that decide or leave the root
+FILES = [
+    ("f", "f"),
+    ("C:", "f"),
+    ("a/f", "f"),
+    ("a/g", "f"),
+    ("./a/f", "f"),
+    ("a/.meta", "f"),
+    ("a/b/.meta", "f"),
+    ("a/b/f", "f"),
+    ("a/.", "f"),
+    ("a/..", "f"),
+    ("a/b/", "f"),
+    ("C:/f", "f"),
+    ("./C:/f", "f"),
+    ("./C:/g", "f"),
+]
+DIRS = [("a", "d"), ("a/b", "d"), ("a/g", "d")]
+#: A symlink that is copied once its target is extracted, where symlinks are not supported
+LINK = ("a/g", "s")
+
+
+@pytest.mark.skipif(not untar._DIR_FD, reason="needs dir file descriptors")
+def test_files_next_to_each_other(tmp_path, monkeypatch):
+    """A regular file that follows one in the same dir is created without going there again.
+    That changes nothing: neither what is extracted, nor what is refused."""
+    never = property(lambda self: None, lambda self, value: None)
+    firsts = [None, ("a", "d"), ("a/f", "f"), ("a/b/.meta", "f"), LINK]
+    cases = itertools.product(firsts, FILES + DIRS, FILES)
+    for i, case in enumerate(cases):
+        members = [
+            (name, kind, {"f": b"x", "s": "later"}.get(kind), 0o644)
+            for name, kind in filter(None, case)
+        ]
+        marker = ".meta" if any(".meta" in name for name, *_ in members) else None
+        with monkeypatch.context() as m:
+            if case[0] == LINK:
+                m.setattr(os, "symlink", fail_with_eperm)
+            actual = outcome(members, tmp_path / f"{i}-actual", root_marker=marker)
+            m.setattr(untar._Extractor, "dirname", never, raising=False)
+            expected = outcome(members, tmp_path / f"{i}-expected", root_marker=marker)
+        assert actual == expected, members
 
 
 # Security

@@ -937,6 +937,10 @@ class _Extractor:
         self.dangling: List[Tuple[List[str], str]] = []
         self.names: List[str] = []
         self.dirs: List[Dir] = []
+        # The name up to its last slash of the regular file that was extracted last, and the
+        # directory it is in, for as long as the next member can go there without navigating.
+        self.dirname: Optional[str] = None
+        self.parent: Dir = -1
 
         if isinstance(dest, int):
             self.dest: Dir = os.dup(dest)
@@ -1115,6 +1119,20 @@ class _Extractor:
             self.descending = member.isdir()
 
     def add(self, member: Member, reader: TarReader) -> None:
+        dirname, _, leaf = member.name.rpartition("/")
+        mode = self.file_mode if member.mode & 0o100 else self.file_mode & ~0o111
+        if (
+            dirname == self.dirname
+            and member.isreg()
+            and leaf not in ("", ".", "..", self.marker_name)
+        ):
+            # Most members are regular files next to the one before them. All of the name but
+            # its last component was checked with that file, whose directory is still open and
+            # is below the root already. The last component is created in that directory by
+            # descriptor, so it cannot lead elsewhere.
+            self._file(self.parent, leaf, mode, reader.chunks(_BUF))
+            return
+        self.dirname = None
         parts = _parts(member.name)
         self._track(member, parts)
         if not parts:
@@ -1138,8 +1156,12 @@ class _Extractor:
             except FileExistsError:
                 self._dir(parts)
         elif member.isreg():
-            mode = self.file_mode if member.mode & 0o100 else self.file_mode & ~0o111
             self._file(parent, parts[-1], mode, reader.chunks(_BUF))
+            # Not at the top, where the last component is all of the name and can be a drive.
+            # Not after a symlink was copied either: a member is refused in the place of one
+            # that is yet to be copied, where nothing exists so far.
+            if dirname and isinstance(parent, int) and not self.copies:
+                self.dirname, self.parent = dirname, parent
         elif member.issym():
             if not member.linkname:
                 raise Error(f"Archive contains symlink {member.name} without a target")
