@@ -16,8 +16,8 @@ dependencies = []
 dynamic = ["version"]
 
 [project.urls]
-Homepage = "https://github.com/haampie/untar"
-Repository = "https://github.com/haampie/untar"
+Homepage = "https://github.com/spack/untar"
+Repository = "https://github.com/spack/untar"
 
 [project.optional-dependencies]
 dev = ["pytest", "hypothesis", "ruff", "mypy"]
