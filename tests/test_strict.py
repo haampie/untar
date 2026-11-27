@@ -873,29 +873,84 @@ def test_copy_only_where_links_are_unsupported(tmp_path, monkeypatch):
 # Compression: outside of the tar layer that tar-minefield covers.
 
 
-def gzipped(size: int) -> bytes:
-    return gzip.compress(make_tar([("f", "f", os.urandom(size), 0o644)]))
+#: The module of each compression format
+MODULES = {"gzip": "gzip", "bzip2": "bz2", "xz": "lzma", "zstd": "compression.zstd"}
+
+
+def compress(format: str, data: bytes) -> bytes:
+    module = pytest.importorskip(MODULES[format])
+    if format != "zstd":
+        return module.compress(data)
+    # A zstd frame has a checksum only if asked for, as the zstd command does
+    options = {module.CompressionParameter.checksum_flag: True}
+    return module.compress(data, options=options)
+
+
+def compressed(size: int, format: str = "gzip") -> bytes:
+    return compress(format, make_tar([("f", "f", os.urandom(size), 0o644)]))
 
 
 @pytest.mark.parametrize("size", [1000, 1046528, 1047040, 2095616])
 def test_gzip_checksum(tmp_path, size):
     """Corrupt data is detected in archives of any size."""
-    archive = bytearray(gzipped(size))
+    archive = bytearray(compressed(size))
     archive[len(archive) // 2] ^= 1
     rejects(bytes(archive), tmp_path, "gzip")
 
 
-@pytest.mark.parametrize("cut", [10, 100, 0.5, -8, -1])
-def test_gzip_truncated(tmp_path, cut):
-    archive = gzipped(100_000)
-    end = int(len(archive) * cut) if isinstance(cut, float) else cut
-    rejects(archive[:end], tmp_path)
-
-
 def test_gzip_invalid(tmp_path):
-    archive = bytearray(gzipped(1000))
+    archive = bytearray(compressed(1000))
     archive[2] = 9  # an unknown compression method
     rejects(bytes(archive), tmp_path, "gzip")
+
+
+@pytest.mark.parametrize("format", MODULES)
+def test_compression(tmp_path, format):
+    """Compression is told by the first bytes, in a stream as in a file. A compressed archive
+    may consist of several compressed streams, and zeros may follow each."""
+    archive = TWO_MEMBERS + EOF
+    path = tmp_path / "archive"
+    path.write_bytes(compress(format, archive))
+    untar.extract(str(path), str(tmp_path / "file"))
+    untar.extract(ReadOnly(compress(format, archive)), str(tmp_path / "stream"))
+    halves = [compress(format, half) for half in (archive[:700], archive[700:])]
+    padded = halves[0] + bytes(512) + halves[1] + bytes(99)
+    untar.extract(ReadOnly(padded), str(tmp_path / "streams"))
+    for dest in ("file", "stream", "streams"):
+        assert sorted(os.listdir(tmp_path / dest)) == ["a", "b"]
+
+
+@pytest.mark.parametrize("format", MODULES)
+def test_compression_invalid(tmp_path, format):
+    """Corrupt and truncated data is refused, and so is what follows a compressed stream and
+    is not zeros, which the file objects of the standard library ignore for some formats."""
+    data = compressed(100_000, format)
+    corrupt = bytearray(data)
+    corrupt[len(data) // 2] ^= 1
+    rejects(bytes(corrupt), tmp_path, format)
+    rejects(data + b"more" * 8, tmp_path, format)
+    rejects(data + bytes(8) + b"more" * 8, tmp_path, format)
+    for end in (11, 100, len(data) // 2, -8, -1):
+        rejects(data[:end], tmp_path, f"truncated|{format}")
+
+
+@pytest.mark.parametrize(
+    "format,magic",
+    [("bzip2", b"BZh91AY&SY"), ("xz", b"\xfd7zXZ\0"), ("zstd", b"\x28\xb5\x2f\xfd")],
+)
+def test_compression_unsupported(tmp_path, monkeypatch, format, magic):
+    """Not every Python has every module: zstd is in the standard library since 3.14. An archive
+    that needs a missing one is told apart from an invalid one."""
+    monkeypatch.setitem(sys.modules, MODULES[format], None)
+    with pytest.raises(untar.UnsupportedCompression, match=format):
+        untar.extract(io.BytesIO(magic + bytes(100)), str(tmp_path))
+    assert os.listdir(tmp_path) == []
+
+
+def test_name_like_bzip2(tmp_path):
+    """An archive whose first name starts like a bzip2 file is not compressed."""
+    untar.extract(io.BytesIO(make_tar([("BZh9/f", "f", b"x", 0o644)])), str(tmp_path))
+    assert (tmp_path / "BZh9" / "f").read_bytes() == b"x"
 
 
 # The destination: what is already there, which no case of tar-minefield has.

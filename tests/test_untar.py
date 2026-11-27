@@ -823,16 +823,6 @@ def test_unseekable_stream_with_short_reads(tmp_path, compress):
     assert snapshot(tmp_path / "actual") == snapshot(tmp_path / "expected")
 
 
-def test_decompresses_once(tmp_path, monkeypatch):
-    def rewind(self):
-        raise AssertionError("gzip stream rewound")
-
-    monkeypatch.setattr(gzip._GzipReader, "_rewind", rewind)
-    path = tmp_path / "a.tar.gz"
-    path.write_bytes(make_tar(SAMPLE[:7], compress=True))
-    untar.extract(str(path), str(tmp_path / "dest"))
-
-
 def test_reader():
     data = make_tar(
         [

@@ -8,7 +8,7 @@ permissions.
 
 import contextlib
 import errno
-import gzip
+import importlib
 import os
 import stat
 import sys
@@ -30,7 +30,7 @@ if sys.platform == "win32":
     _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 
 __version__ = "1.0.0.dev0"
-__all__ = ["Error", "Member", "TarReader", "extract"]
+__all__ = ["Error", "Member", "TarReader", "UnsupportedCompression", "extract"]
 
 REGTYPE = b"0"
 AREGTYPE = b"\0"
@@ -82,11 +82,14 @@ _MAX_OPEN_DIRS = 64
 # Limit directory nesting depth; deep paths degrade to quadratic creation time on macOS.
 _MAX_DEPTH = 1024
 _DRIVES = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-_BadGzipFile = getattr(gzip, "BadGzipFile", OSError)
 
 
 class Error(ValueError):
     """The archive is invalid or cannot be extracted safely."""
+
+
+class UnsupportedCompression(Error):
+    """The archive is compressed in a format that this Python cannot decompress."""
 
 
 class Member:
@@ -503,32 +506,101 @@ class _Prepend:
         return data
 
 
-class _Gzip:
-    """A gzip stream wrapper that translates decompression errors into ``untar.Error``."""
+class _Inflate:
+    """zlib's gzip decompressor, with the interface of the decompressors of bz2 and lzma."""
 
-    def __init__(self, stream: _Prepend) -> None:
-        self.gzip = gzip.GzipFile(fileobj=stream, mode="rb")  # type: ignore[call-overload]
+    def __init__(self) -> None:
+        self.inflate = zlib.decompressobj(31)
+        self.needs_input = True
 
-    def read(self, size: int = -1) -> bytes:
+    def decompress(self, data: bytes, size: int) -> bytes:
+        out = self.inflate.decompress(self.inflate.unconsumed_tail + data, size)
+        self.needs_input = not self.inflate.unconsumed_tail and len(out) < size
+        return out
+
+    @property
+    def eof(self) -> bool:
+        return self.inflate.eof
+
+    @property
+    def unused_data(self) -> bytes:
+        return self.inflate.unused_data
+
+
+def _decompressor(format: str) -> Tuple[Any, Any]:
+    """The decompressor of a format, and what it raises for invalid data. Its module is
+    imported here, as not every Python has it: zstd is in the standard library since 3.14."""
+    if format == "gzip":
+        return _Inflate, zlib.error
+    if format == "bzip2":
+        import bz2
+
+        return bz2.BZ2Decompressor, OSError
+    if format == "xz":
+        import lzma
+
+        return lzma.LZMADecompressor, lzma.LZMAError
+    zstd: Any = importlib.import_module("compression.zstd")
+    return zstd.ZstdDecompressor, zstd.ZstdError
+
+
+class _Decompress:
+    """A gzip, bzip2, xz or zstd stream wrapper. It reads one or more compressed streams, and
+    refuses anything after them but zeros."""
+
+    def __init__(self, stream: _Prepend, format: str) -> None:
+        self.stream = stream
+        self.format = format
         try:
-            return self.gzip.read(size)
-        except EOFError:
-            raise Error("Archive is truncated") from None
-        except (zlib.error, _BadGzipFile) as e:
-            raise Error(f"Archive is not valid gzip: {e}") from e
+            self.new, self.errors = _decompressor(format)
+        except ImportError:
+            raise UnsupportedCompression(
+                f"Archive is compressed with {format}, which this Python does not support"
+            ) from None
+        self.decompressor = self.new()
+
+    def read(self, size: int) -> bytes:
+        while True:
+            d, data = self.decompressor, b""
+            if d.eof:
+                data = d.unused_data.lstrip(b"\0")
+                while not data:
+                    data = self.stream.read(_BUF)
+                    if not data:
+                        return b""
+                    data = data.lstrip(b"\0")
+                d = self.decompressor = self.new()
+            elif d.needs_input:
+                data = self.stream.read(_BUF)
+                if not data:
+                    raise Error("Archive is truncated")
+            try:
+                out = d.decompress(data, size)
+            except self.errors as e:
+                raise Error(f"Archive is not valid {self.format}: {e}") from e
+            if out:
+                return out
 
 
 @contextlib.contextmanager
 def _open_archive(
     src: Union[str, "os.PathLike[str]", IO[bytes]],
 ) -> Iterator[IO[bytes]]:
-    """Open a file path or binary stream, transparently decompressing gzip if detected."""
+    """Open a file path or binary stream, decompressing it if its first bytes say so."""
     file = open(src, "rb") if isinstance(src, (str, os.PathLike)) else None  # noqa: SIM115
     try:
         stream = file or src
-        magic = _fill(stream, 2)  # type: ignore[arg-type]
-        head = _Prepend(magic, stream)  # type: ignore[arg-type]
-        yield _Gzip(head) if magic == b"\x1f\x8b" else head  # type: ignore
+        magic = _fill(stream, 10)  # type: ignore[arg-type]
+        head: Any = _Prepend(magic, stream)  # type: ignore[arg-type]
+        if magic.startswith(b"\x1f\x8b"):
+            head = _Decompress(head, "gzip")
+        elif magic.startswith(b"BZh") and magic[4:10] in (b"1AY&SY", b"\x17rE8P\x90"):
+            head = _Decompress(head, "bzip2")
+        elif magic.startswith(b"\xfd7zXZ\0"):
+            head = _Decompress(head, "xz")
+        elif magic.startswith(b"\x28\xb5\x2f\xfd"):
+            head = _Decompress(head, "zstd")
+        yield head
     finally:
         if file is not None:
             file.close()
@@ -1159,10 +1231,11 @@ def extract(
     Where links cannot be created, the file that a link points to is copied instead. A symlink
     that cannot be copied (one to a directory, or to a target outside the archive) is an error.
 
-    Raises ``untar.Error`` for an archive that is invalid or unsafe, and ``OSError`` for an
-    operation that the operating system refuses: notably ``FileExistsError`` for a name that
-    occurs twice in the archive, since entries are never replaced. Catch
-    ``(untar.Error, OSError)`` to handle every rejected archive, as the command line does.
+    Raises ``untar.Error`` for an archive that is invalid or unsafe, its subclass
+    ``untar.UnsupportedCompression`` for one that this Python cannot decompress, and ``OSError`` for
+    an operation that the operating system refuses: notably ``FileExistsError`` for a name that
+    occurs twice in the archive, since entries are never replaced. Catch ``(untar.Error, OSError)``
+    to handle every rejected archive, as the command line does.
     """
     if isinstance(dest, int) and not _DIR_FD:
         raise ValueError("dest cannot be a file descriptor on this platform")
@@ -1187,7 +1260,7 @@ def _main(argv: Optional[List[str]] = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="python -m untar",
-        description="Extract a tar archive, optionally gzip compressed, into a directory.",
+        description="Extract a tar archive, optionally compressed, into a directory.",
     )
     parser.add_argument("archive", help="the archive, or - to read standard input")
     parser.add_argument(

@@ -276,11 +276,17 @@ def test_extract_like_tarfile(tmp_path):
 
 
 @needs_testdata
-@pytest.mark.parametrize("name", ["testtar.tar.xz", "recursion.tar"])
-def test_unsupported_archives(name):
-    """DetectReadTest: compressions other than gzip are not detected; recursion.tar is invalid."""
+def test_invalid_archive(tmp_path):
+    """recursion.tar is invalid."""
     with pytest.raises(untar.Error):
-        untar.extract(os.path.join(TESTDATA, name), "unused")
+        untar.extract(os.path.join(TESTDATA, "recursion.tar"), str(tmp_path))
+
+
+@needs_testdata
+def test_xz(tmp_path):
+    """DetectReadTest: xz is detected."""
+    untar.extract(os.path.join(TESTDATA, "testtar.tar.xz"), str(tmp_path))
+    assert os.listdir(tmp_path) == ["test.txt"]
 
 
 @needs_testdata

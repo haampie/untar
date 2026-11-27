@@ -9,10 +9,12 @@ from test_untar import SAMPLE, make_tar, needs_symlinks, snapshot, tarfile_extra
 
 import untar
 
+#: For a subprocess to import the untar that the tests import
+ENV = dict(os.environ, PYTHONPATH=os.path.dirname(os.path.abspath(untar.__file__)))
+
 
 def run(cwd, *args, stdin=None):
     """Run python -m untar in cwd, on the untar that the tests import."""
-    env = dict(os.environ, PYTHONPATH=os.path.dirname(os.path.abspath(untar.__file__)))
     # Not capture_output, which needs Python 3.7
     return subprocess.run(  # noqa: UP022
         [sys.executable, "-m", "untar", *args],
@@ -20,7 +22,7 @@ def run(cwd, *args, stdin=None):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=str(cwd),
-        env=env,
+        env=ENV,
         check=False,
     )
 
@@ -61,3 +63,12 @@ def test_usage(tmp_path):
     result = run(tmp_path, str(tmp_path))
     assert result.returncode == 2
     assert b"usage: python -m untar" in result.stderr
+
+
+def test_imports_no_compression(tmp_path):
+    """The modules that decompress are imported when an archive needs them, not before."""
+    code = "import sys, untar; print([m for m in ('gzip', 'bz2', 'lzma') if m in sys.modules])"
+    out = subprocess.check_output(
+        [sys.executable, "-S", "-c", code], cwd=str(tmp_path), env=ENV
+    )
+    assert out.strip() == b"[]"

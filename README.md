@@ -9,7 +9,7 @@ rather than filesystem backups, and supports Python 3.6 and later with no depend
 ```python
 import untar
 
-# Extract an archive from a file path or any readable binary stream (.tar or .tar.gz)
+# Extract an archive from a file path or any readable binary stream, compressed or not
 untar.extract("pkg.tar.gz", "/opt/pkg")
 
 # Extract the directory containing `.meta`, wherever it appears in the archive
@@ -26,17 +26,18 @@ The destination directory is created if it does not exist. If any top-level entr
 already exists in the destination, extraction fails and leaves the destination unchanged (exiting
 with status 2 on the CLI).
 
-An invalid or unsafe archive raises `untar.Error`. Operations that the operating system refuses
-raise `OSError` instead, notably `FileExistsError` for a name that occurs twice in an archive, since
-entries are never replaced. Catch `(untar.Error, OSError)` to handle every rejected archive, as the
-command line does.
+An invalid or unsafe archive raises `untar.Error`, and one compressed in a format that this Python
+cannot decompress raises its subclass `untar.UnsupportedCompression`. Operations that the operating
+system refuses raise `OSError` instead, notably `FileExistsError` for a name that occurs twice in an
+archive, since entries are never replaced. Catch `(untar.Error, OSError)` to handle every rejected
+archive, as the command line does.
 
 ### Options
 
 `untar.extract(src, dest, *, root_marker=None, file_mode=0o755, dir_mode=0o755, gid=None, mtime=None)`:
 
-- `src`: a file path or any readable binary stream. Gzip compression is detected automatically from
-  the first two bytes.
+- `src`: a file path or any readable binary stream. Compression with gzip, bzip2, xz or zstd is
+  detected from the first bytes; zstd needs Python 3.14 or later.
 - `dest`: a directory path or, on POSIX, an open directory file descriptor.
 - `root_marker`: extract only the parent directory of the shallowest member with this filename, and
   return that directory's path in the archive (similar to `tar --strip-components` when the nesting
@@ -51,11 +52,11 @@ command line does.
 ## Safety
 
 - **Atomic against archive errors:** Members are extracted into a temporary directory inside the
-  destination and moved into place only after the full stream (including the gzip checksum) has been
-  read and verified. An invalid archive leaves the destination untouched, as does a truncated one
-  that is compressed or cut inside a member. The end-of-archive marker is optional (ruby's release
-  tarballs lack it), so an uncompressed archive cut exactly between two members cannot be told
-  apart from a complete one.
+  destination and moved into place only after the full stream (including the checksum of its
+  compression) has been read and verified. An invalid archive leaves the destination untouched, as
+  does a truncated one that is compressed or cut inside a member. The end-of-archive marker is
+  optional (ruby's release tarballs lack it), so an uncompressed archive cut exactly between two
+  members cannot be told apart from a complete one.
 - **No traversal or overwrites:** Absolute paths, `..` components, backslashes, and Windows drive
   letters are rejected. Directories are opened with `O_NOFOLLOW` and files are created with
   `O_EXCL | O_NOFOLLOW`, so `untar` never writes through symlinks or overwrites existing files.
