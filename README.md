@@ -30,7 +30,7 @@ An invalid or unsafe archive raises `untar.Error`, and one compressed in a forma
 cannot decompress raises its subclass `untar.UnsupportedCompression`. Operations that the operating
 system refuses raise `OSError` instead, notably `FileExistsError` for a name that occurs twice in an
 archive, since entries are never replaced. Catch `(untar.Error, OSError)` to handle every rejected
-archive, as the command line does.
+archive.
 
 ### Options
 
