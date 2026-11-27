@@ -2,7 +2,7 @@
 
 `untar` is a pure Python package for extracting tar archives with good performance and strong safety
 guarantees. It targets software distribution archives (source tarballs, packages, release artifacts)
-rather than filesystem backups, and supports Python 3.6 and later with no dependencies.
+rather than filesystem backups, and supports Python 3.6 and later.
 
 ## Usage
 
